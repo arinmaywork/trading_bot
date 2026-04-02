@@ -19,6 +19,26 @@ Full startup sequence:
   6. SIGINT/SIGTERM → graceful shutdown of all tasks.
 """
 
+# ---------------------------------------------------------------------------
+# R-09 FIX: Force IPv4 for all outbound connections.
+# Home ISPs rotate IPv6 prefixes periodically, causing PermissionException
+# when the new IPv6 is not in the Kite API whitelist. IPv4 addresses are far
+# more stable. This patch reorders DNS results so IPv4 (AF_INET) is always
+# tried first; IPv6 is kept as a fallback in case no IPv4 route exists.
+# Must run before any network-touching import (kiteconnect, aiohttp, etc.).
+# ---------------------------------------------------------------------------
+import socket as _socket
+_orig_getaddrinfo = _socket.getaddrinfo
+
+def _ipv4_preferred(host, port, family=0, type=0, proto=0, flags=0):
+    results = _orig_getaddrinfo(host, port, family, type, proto, flags)
+    ipv4 = [r for r in results if r[0] == _socket.AF_INET]
+    ipv6 = [r for r in results if r[0] != _socket.AF_INET]
+    return ipv4 + ipv6
+
+_socket.getaddrinfo = _ipv4_preferred
+# ---------------------------------------------------------------------------
+
 import asyncio
 import json
 import logging
