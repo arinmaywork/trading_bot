@@ -98,16 +98,47 @@ class TelegramNotifier:
     """
     Non-blocking Telegram Bot API integration.
     Uses aiohttp for async HTTP; failures are logged but never raise.
+
+    Rate-limit handling:
+      • Telegram allows ~30 messages/minute per chat.
+      • On a 429 response, backs off for the server-specified retry_after seconds
+        (capped at 60 s) before the next send is allowed.
+      • A per-minute message counter drops any send that would exceed the cap,
+        preventing the 421-second ban cascade caused by flooding the API.
     """
+
+    _RATE_CAP_PER_MINUTE = 20   # stay well under Telegram's 30/min limit
 
     def __init__(self) -> None:
         cfg = settings.telegram
         self._url = f"{cfg.API_BASE}{cfg.BOT_TOKEN}/sendMessage"
         self._chat_id = cfg.CHAT_ID
         self._timeout = aiohttp.ClientTimeout(total=cfg.SEND_TIMEOUT_SECONDS)
+        # Rate-limit state
+        self._blocked_until: float = 0.0   # monotonic ts; send() waits if now < this
+        self._minute_window: float = 0.0   # start of current 60-s window
+        self._minute_count:  int   = 0     # messages sent in current window
 
     async def send(self, text: str) -> None:
         """Fire-and-forget Telegram message. HTML parse mode is used."""
+        now = time.monotonic()
+
+        # Enforce per-minute cap — drop silently if over limit
+        if now - self._minute_window >= 60.0:
+            self._minute_window = now
+            self._minute_count  = 0
+        if self._minute_count >= self._RATE_CAP_PER_MINUTE:
+            logger.debug("Telegram rate cap reached (%d/min) — message dropped.",
+                         self._RATE_CAP_PER_MINUTE)
+            return
+        self._minute_count += 1
+
+        # Wait out any active backoff from a previous 429
+        wait = self._blocked_until - time.monotonic()
+        if wait > 0:
+            logger.debug("Telegram backoff active — waiting %.1f s", wait)
+            await asyncio.sleep(wait)
+
         payload = {
             "chat_id": self._chat_id,
             "text": text,
@@ -117,7 +148,22 @@ class TelegramNotifier:
         try:
             async with aiohttp.ClientSession(timeout=self._timeout) as session:
                 async with session.post(self._url, json=payload) as resp:
-                    if resp.status != 200:
+                    if resp.status == 429:
+                        try:
+                            body = await resp.json()
+                            retry_after = int(
+                                body.get("parameters", {}).get("retry_after", 10)
+                            )
+                        except Exception:
+                            retry_after = 10
+                        # Cap at 60 s — longer bans mean we just skip messages
+                        backoff = min(retry_after, 60)
+                        self._blocked_until = time.monotonic() + backoff
+                        logger.warning(
+                            "Telegram 429 — backing off %d s (server asked %d s)",
+                            backoff, retry_after,
+                        )
+                    elif resp.status != 200:
                         body = await resp.text()
                         logger.warning("Telegram non-200 response %d: %s",
                                        resp.status, body[:200])
@@ -312,6 +358,9 @@ class OrderExecutor:
         # B-08 FIX: removed self._loop = asyncio.get_event_loop()
         # get_event_loop() is deprecated in Python 3.10+ and raises RuntimeError in 3.12.
         # Use asyncio.get_running_loop() inside each async method instead.
+        # R-08 FIX: track PermissionException state so we send ONE alert and
+        # skip all subsequent order attempts without hitting Zerodha or Telegram.
+        self._permission_denied: bool = False
 
     async def _place_single_order(
         self,
@@ -410,7 +459,11 @@ class OrderExecutor:
 
             except KiteExceptions.PermissionException as exc:
                 # IP not whitelisted or API permissions issue — non-retryable.
-                # Retrying will never succeed; abort immediately and alert.
+                # Retrying will never succeed; abort immediately.
+                # R-08 FIX: Only send ONE Telegram alert per session. The first call
+                # sets _permission_denied=True and fires the alert; every subsequent
+                # call returns immediately without contacting Telegram or Zerodha,
+                # preventing the 421-second ban cascade.
                 err_msg = f"PermissionException: {exc}"
                 logger.error(
                     "PermissionException (non-retryable) for %s: %s\n"
@@ -418,13 +471,17 @@ class OrderExecutor:
                     "https://developers.kite.trade (Settings → Allowed IPs).",
                     symbol, exc
                 )
-                await self._telegram.send(
-                    f"🚫 <b>PermissionException — orders blocked</b>\n"
-                    f"Symbol: {symbol}\n"
-                    f"Reason: {exc}\n\n"
-                    f"Add your public IP at:\nhttps://developers.kite.trade\n"
-                    f"(Settings → Allowed IPs), then restart the bot."
-                )
+                if not self._permission_denied:
+                    self._permission_denied = True
+                    await self._telegram.send(
+                        f"🚫 <b>PermissionException — ALL orders blocked</b>\n"
+                        f"Symbol: {symbol}\n"
+                        f"Reason: {exc}\n\n"
+                        f"Add your server's public IP / IPv6 at:\n"
+                        f"https://developers.kite.trade\n"
+                        f"(Settings → Allowed IPs), then restart the bot.\n\n"
+                        f"<i>Further order attempts suppressed until restart.</i>"
+                    )
                 return None, None, err_msg
 
             except KiteExceptions.OrderException as exc:
@@ -498,6 +555,20 @@ class OrderExecutor:
             geo_alpha_multiplier=signal.geo_alpha_multiplier,
             geo_kelly_multiplier=signal.geo_kelly_multiplier,
         )
+
+        # ---- Guard: PermissionException already seen this session ----
+        # R-08 FIX: If the IP is not whitelisted, every order attempt will fail
+        # with a PermissionException. Skip slicing / placing entirely to avoid
+        # flooding Zerodha and Telegram. The single alert was already sent on
+        # the first failure.
+        if self._permission_denied:
+            report.error = "Orders blocked: IP not whitelisted (PermissionException). See Telegram alert."
+            report.success = False
+            logger.warning(
+                "execute() skipped for %s — PermissionException already raised this session.",
+                signal.symbol,
+            )
+            return report
 
         # ---- Guard: only execute actionable signals ----
         if not signal.is_actionable:
