@@ -229,7 +229,7 @@ class StrategyConfig:
     )
     KELLY_FRACTION:              float = 0.50   # Used as fallback only; Busseti is primary
     MAX_POSITION_FRACTION:       float = 0.05
-    MIN_ALPHA_THRESHOLD:         float = 0.001
+    MIN_ALPHA_THRESHOLD:         float = 0.005  # R-10: raised from 0.001 → 0.5% min signal
     VOL_SPIKE_THRESHOLD:         float = 2.0
     GEOPOLITICAL_RISK_THRESHOLD: float = 0.65
     VWAP_LOOKBACK:               int   = 30
@@ -241,6 +241,28 @@ class StrategyConfig:
     MIN_POLL_INTERVAL_SECONDS:   float = 0.5
     MAX_POLL_INTERVAL_SECONDS:   float = 5.0
     POLL_INTERVAL_PER_SYMBOL_MS: float = 20.0
+
+    # ---------------------------------------------------------------------------
+    # R-10: Transaction cost awareness (Zerodha NSE-EQ intraday / MIS)
+    # ---------------------------------------------------------------------------
+    # Zerodha charges ₹20 flat OR 0.03% of order value (whichever is lower)
+    # per executed order. For a round trip (buy + sell) = 2 orders = up to ₹40.
+    BROKERAGE_PER_ORDER:         float = 20.0    # ₹ per executed order (flat cap)
+    BROKERAGE_PCT:               float = 0.0003  # 0.03% — used when < flat cap
+    STT_INTRADAY_SELL_RATE:      float = 0.00025 # 0.025% STT on sell-side only (intraday)
+    EXCHANGE_CHARGE_RATE:        float = 0.0000345  # NSE turnover charge (both sides)
+
+    # Minimum ₹ value per trade so brokerage stays a small fraction of P&L.
+    # Example: ₹2000 position → brokerage ≈ ₹40 → only 2% cost hurdle vs P&L.
+    # Trades that can't reach this value are skipped (cost would exceed profit).
+    MIN_TRADE_VALUE:             float = field(
+        default_factory=lambda: float(_optional("MIN_TRADE_VALUE", "2000"))
+    )
+
+    # Forced square-off time (IST). All open MIS positions closed at this time
+    # to avoid Zerodha auto square-off charges (₹50+GST per position after 3:20 PM).
+    SQUARE_OFF_HOUR_IST:         int   = 15
+    SQUARE_OFF_MINUTE_IST:       int   = 15
 
 
 # ---------------------------------------------------------------------------

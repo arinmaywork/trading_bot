@@ -385,6 +385,14 @@ async def strategy_loop(
     _order_cooldowns: Dict[str, float] = {}   # symbol → monotonic ts of last order
     _open_positions:  Dict[str, int]   = {}   # symbol → net MIS qty (+ long, − short)
 
+    # R-10: Simple state object for the forced square-off flag.
+    # squareoff_done_today resets each calendar day so the bot squares off
+    # exactly once per trading session.
+    class _LoopState:
+        squareoff_done_today: bool = False
+        squareoff_date: Optional[date] = None
+    _strategy_loop_state = _LoopState()
+
     while True:
         cycle_start = time.monotonic()
         _cycle   += 1
@@ -555,6 +563,73 @@ async def strategy_loop(
         except Exception as exc:
             logger.warning("Positions fetch failed (skipping guard this cycle): %s", exc)
             # Keep _open_positions from the previous cycle as a best-effort fallback
+
+        # ── R-10: Forced square-off at 3:15 PM IST ───────────────────────────
+        # Zerodha auto-squares all open MIS positions at ~3:20 PM and charges
+        # ₹50 + 18% GST (≈ ₹59) per position. We pre-empt this by closing all
+        # open positions ourselves at 3:15 PM using MARKET orders.
+        _ist_now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+
+        # Reset square-off flag at start of each new trading day
+        if _strategy_loop_state.squareoff_date != _ist_now.date():
+            _strategy_loop_state.squareoff_done_today = False
+            _strategy_loop_state.squareoff_date = _ist_now.date()
+        _past_squareoff = (
+            _ist_now.hour > settings.strategy.SQUARE_OFF_HOUR_IST
+            or (
+                _ist_now.hour == settings.strategy.SQUARE_OFF_HOUR_IST
+                and _ist_now.minute >= settings.strategy.SQUARE_OFF_MINUTE_IST
+            )
+        )
+        if _past_squareoff:
+            open_to_close = {s: q for s, q in _open_positions.items() if q != 0}
+            if open_to_close and not getattr(_strategy_loop_state, "squareoff_done_today", False):
+                logger.warning(
+                    "⏰ 3:15 PM IST — force-closing %d open MIS position(s): %s",
+                    len(open_to_close), list(open_to_close.keys()),
+                )
+                await telegram.send(
+                    f"⏰ <b>3:15 PM Square-Off</b>\n"
+                    f"Closing {len(open_to_close)} open MIS position(s) to avoid "
+                    f"Zerodha auto-square charges.\n"
+                    + "\n".join(
+                        f"  {'SELL' if q > 0 else 'BUY'} {s} qty={abs(q)}"
+                        for s, q in open_to_close.items()
+                    )
+                )
+                for sym, qty in open_to_close.items():
+                    try:
+                        close_direction = (
+                            kite.TRANSACTION_TYPE_SELL if qty > 0
+                            else kite.TRANSACTION_TYPE_BUY
+                        )
+                        close_qty = abs(qty)
+                        async with rate_limiter.order_slot():
+                            sq_id = await loop.run_in_executor(
+                                None,
+                                lambda s=sym, d=close_direction, q=close_qty: kite.place_order(
+                                    variety=settings.kite.ORDER_VARIETY,
+                                    exchange=settings.kite.EXCHANGE,
+                                    tradingsymbol=s,
+                                    transaction_type=d,
+                                    quantity=q,
+                                    product=settings.kite.PRODUCT,
+                                    order_type="MARKET",   # MARKET for guaranteed fill
+                                    tag="SS_SQUAREOFF",
+                                )
+                            )
+                        logger.info("Square-off placed: %s qty=%d → order_id=%s", sym, close_qty, sq_id)
+                    except Exception as sq_exc:
+                        logger.error("Square-off FAILED for %s: %s", sym, sq_exc)
+                        await telegram.send(
+                            f"⚠️ <b>Square-off failed for {sym}</b>: {sq_exc}\n"
+                            f"Please close manually in Kite immediately!"
+                        )
+                _strategy_loop_state.squareoff_done_today = True
+
+            # Skip all new signal entries after 3:15 PM — no new positions
+            continue
+        # ── End forced square-off ────────────────────────────────────────────
 
         # ---- Per-symbol signal evaluation ----
         actionable_count = 0

@@ -414,6 +414,52 @@ class RiskManager:
         cap_qty  = int((geo_cap * self._capital) / current_price)
         final    = min(raw_qty, cap_qty, 10_000)   # hard absolute cap
 
+        # ── R-10: Transaction cost filter ────────────────────────────────────
+        # Zerodha charges ₹20/order flat (or 0.03% if lower) + 0.025% STT on
+        # the sell side. For a round trip that's up to ₹40 + STT.
+        # Only place the trade if the expected P&L exceeds total round-trip cost.
+        # If the Kelly qty is too small, try bumping to MIN_TRADE_VALUE first.
+        if final > 0:
+            cfg_costs = settings.strategy
+
+            def _round_trip_cost(qty: int) -> float:
+                order_val   = current_price * qty
+                brok_buy    = min(cfg_costs.BROKERAGE_PER_ORDER, cfg_costs.BROKERAGE_PCT * order_val)
+                brok_sell   = min(cfg_costs.BROKERAGE_PER_ORDER, cfg_costs.BROKERAGE_PCT * order_val)
+                stt_sell    = cfg_costs.STT_INTRADAY_SELL_RATE * order_val
+                exch        = cfg_costs.EXCHANGE_CHARGE_RATE * order_val * 2  # both sides
+                return brok_buy + brok_sell + stt_sell + exch
+
+            def _expected_pnl(qty: int) -> float:
+                return abs(ml_signal) * current_price * qty
+
+            cost   = _round_trip_cost(final)
+            exp_pl = _expected_pnl(final)
+
+            if exp_pl < cost:
+                # Kelly qty is too small — try bumping up to MIN_TRADE_VALUE
+                min_qty = math.ceil(cfg_costs.MIN_TRADE_VALUE / current_price)
+                min_qty = max(min_qty, final)
+                max_allowed = int(cfg_costs.MAX_POSITION_FRACTION * self._capital / current_price)
+                if min_qty <= max_allowed and _expected_pnl(min_qty) > _round_trip_cost(min_qty):
+                    logger.info(
+                        "CostFilter %s: bumping qty %d→%d to clear brokerage hurdle "
+                        "(exp_pnl=₹%.2f cost=₹%.2f)",
+                        symbol, final, min_qty, _expected_pnl(min_qty), _round_trip_cost(min_qty),
+                    )
+                    final = min_qty
+                else:
+                    logger.info(
+                        "CostFilter %s: skipping — exp_pnl=₹%.2f < cost=₹%.2f "
+                        "(brokerage+STT hurdle not cleared even at min_trade_value=₹%.0f)",
+                        symbol, exp_pl, cost, cfg_costs.MIN_TRADE_VALUE,
+                    )
+                    return 0, f_final, f_busseti, False, (
+                        f"Trade cost ₹{cost:.2f} > expected P&L ₹{exp_pl:.2f} — "
+                        f"increase capital or wait for stronger signal"
+                    )
+        # ── End cost filter ──────────────────────────────────────────────────
+
         reason = (
             f"{method} | f_busseti={f_busseti:.4f} "
             f"→ f_geo={f_geo:.4f} (GRI_mult={gri.kelly_multiplier:.2f}) "
