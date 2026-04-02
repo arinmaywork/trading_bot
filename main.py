@@ -448,8 +448,35 @@ async def strategy_loop(
 
         except Exception as exc:
             estr = str(exc).lower()
-            if any(x in estr for x in ["token", "403", "401", "invalid"]):
-                logger.critical("TOKEN EXPIRED — update KITE_ACCESS_TOKEN and restart: %s", exc)
+            if any(x in estr for x in ["token", "403", "401", "invalid",
+                                        "incorrect", "access_token"]):
+                logger.critical("TOKEN EXPIRED: %s", exc)
+                if bot_state:
+                    bot_state.token_valid = False
+                    bot_state.paused = True
+                # Alert via Telegram — instruct user to send /login then /token
+                try:
+                    login_url = kite.login_url()
+                    await telegram.send(
+                        f"🔑 <b>Zerodha Token Expired — Action Required</b>\n"
+                        f"{'─' * 34}\n"
+                        f"The access token has expired. Trading is paused.\n\n"
+                        f"<b>To refresh without restarting:</b>\n"
+                        f"1. Open: <code>{login_url}</code>\n"
+                        f"2. Log in and copy the <code>request_token</code> "
+                        f"from the redirect URL\n"
+                        f"3. Send: <code>/token &lt;request_token&gt;</code>\n\n"
+                        f"Trading resumes automatically once the token is refreshed."
+                    )
+                except Exception:
+                    pass
+                # Wait for token to be refreshed via /token command
+                if bot_state:
+                    logger.info("Waiting for /token via Telegram…")
+                    while not bot_state.token_valid:
+                        await asyncio.sleep(10)
+                    logger.info("Token refreshed — resuming strategy loop.")
+                    bot_state.paused = False
             else:
                 logger.error("LTP batch failed: %s", exc)
             await asyncio.sleep(interval)
@@ -699,6 +726,9 @@ async def main(kite: KiteConnect, access_token: str) -> None:
     logbook        = Logbook()
     bot_state      = BotState()
     tg_controller  = TelegramController(bot_state)
+    # Register the live kite instance so /login and /token commands can
+    # hot-swap the daily access token without restarting the bot.
+    tg_controller.set_kite(kite, settings.kite.API_SECRET)
     strategy_engine = StrategyEngine(redis_client, risk_manager, ml_engine)
     executor        = OrderExecutor(kite, rate_limiter, telegram)
 

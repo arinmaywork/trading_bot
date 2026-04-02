@@ -24,11 +24,13 @@ Commands:
 """
 
 import asyncio
+import json
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, date, timezone, timedelta
 from enum import Enum
+from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 import aiohttp
@@ -88,6 +90,10 @@ class BotState:
     mode_confirmed: bool         = False     # True once user has chosen mode
     start_time:     datetime     = field(default_factory=_ist_now)
 
+    # Token refresh state
+    token_valid:    bool         = True   # set False on TokenException
+    token_refresh_event: asyncio.Event = field(default_factory=asyncio.Event)
+
     # Live metrics (updated by strategy_loop)
     last_gri:       float        = 0.0
     last_gri_level: str          = "UNKNOWN"
@@ -135,6 +141,37 @@ class TelegramController:
         self._stop_event = asyncio.Event()
         if state.mode_confirmed:
             self._mode_chosen_event.set()
+        # Kite reference — populated by main.py via set_kite()
+        self._kite             = None
+        self._api_secret       = ""
+        self._token_cache_file = Path(__file__).parent / ".kite_token"
+
+    # ── Token hot-swap ────────────────────────────────────────────────────
+
+    def set_kite(self, kite: Any, api_secret: str,
+                 token_cache_file: Optional[Path] = None) -> None:
+        """
+        Register the live KiteConnect instance so the /login and /token
+        commands can refresh the access token without restarting the bot.
+
+        Call this once from main.py after the initial authentication:
+            telegram_controller.set_kite(kite, settings.kite.API_SECRET)
+        """
+        self._kite             = kite
+        self._api_secret       = api_secret
+        self._token_cache_file = token_cache_file or (
+            Path(__file__).parent / ".kite_token"
+        )
+
+    def _save_token_cache(self, token: str) -> None:
+        try:
+            self._token_cache_file.write_text(
+                json.dumps({"access_token": token,
+                            "generated_date": date.today().isoformat()}, indent=2)
+            )
+            self._token_cache_file.chmod(0o600)
+        except OSError as exc:
+            logger.warning("Could not write token cache: %s", exc)
 
     @property
     def stop_requested(self) -> bool:
@@ -261,6 +298,12 @@ class TelegramController:
                 "/pause — Pause order execution\n"
                 "/resume — Resume order execution\n"
                 "/stop — Graceful shutdown\n"
+                f"{'─' * 28}\n"
+                "🔑 <b>Daily Token Refresh (no restart needed)</b>\n"
+                "/login — Get today's Zerodha login URL\n"
+                "/token &lt;request_token&gt; — Apply new token\n"
+                "  Or paste the full redirect URL after /token\n"
+                f"{'─' * 28}\n"
                 "/help — This message\n"
             )
             if not self._state.mode_confirmed:
@@ -279,6 +322,75 @@ class TelegramController:
         elif cmd == "/resume":
             self._state.paused = False
             await self.send("▶️ <b>Trading resumed.</b>")
+
+        elif cmd == "/login":
+            if self._kite is None:
+                await self.send(
+                    "⚠️ Kite not initialised yet — please wait for bot startup to complete."
+                )
+            else:
+                login_url = self._kite.login_url()
+                await self.send(
+                    f"🔑 <b>Zerodha Login — Daily Token Refresh</b>\n"
+                    f"{'─' * 34}\n"
+                    f"1️⃣ Open this link and log in:\n"
+                    f"<code>{login_url}</code>\n\n"
+                    f"2️⃣ After login you'll be redirected to a URL like:\n"
+                    f"<code>http://127.0.0.1/?request_token=XXXXXXXX&amp;status=success</code>\n\n"
+                    f"3️⃣ Send the token to this chat:\n"
+                    f"<code>/token XXXXXXXX</code>\n"
+                    f"(or paste the full redirect URL after /token)\n\n"
+                    f"⏱ The token expires at midnight — refresh each morning before 9:15 AM IST."
+                )
+
+        elif cmd == "/token":
+            parts = text.strip().split(None, 1)
+            raw = parts[1].strip() if len(parts) > 1 else ""
+            # Support both bare request_token and full redirect URL
+            if "request_token=" in raw:
+                raw = raw.split("request_token=")[1].split("&")[0].strip()
+            if not raw:
+                await self.send(
+                    "⚠️ Usage: <code>/token &lt;request_token&gt;</code>\n"
+                    "Send /login to get the login URL first."
+                )
+            elif self._kite is None:
+                await self.send("⚠️ Kite not initialised — cannot refresh token yet.")
+            else:
+                await self.send("🔄 Exchanging request_token for access token…")
+                try:
+                    loop = asyncio.get_running_loop()
+                    session = await loop.run_in_executor(
+                        None,
+                        lambda rt=raw: self._kite.generate_session(
+                            rt, api_secret=self._api_secret
+                        )
+                    )
+                    new_token = session["access_token"]
+                    # Hot-swap into the running kite instance
+                    self._kite.set_access_token(new_token)
+                    self._save_token_cache(new_token)
+                    # Signal the strategy loop that the token is fresh
+                    self._state.token_valid = True
+                    self._state.token_refresh_event.set()
+                    self._state.token_refresh_event.clear()
+                    logger.info("Access token hot-swapped successfully via Telegram /token.")
+                    await self.send(
+                        f"✅ <b>Token refreshed successfully!</b>\n"
+                        f"{'─' * 34}\n"
+                        f"🕐 {_fmt_time()}\n"
+                        f"Trading will resume immediately.\n"
+                        f"Send /status to confirm."
+                    )
+                except Exception as exc:
+                    logger.error("Token refresh via Telegram failed: %s", exc)
+                    await self.send(
+                        f"❌ <b>Token refresh failed</b>\n"
+                        f"Error: <code>{exc}</code>\n\n"
+                        f"Make sure you copied the correct request_token "
+                        f"(it's valid for only ~2 minutes after login). "
+                        f"Send /login to try again."
+                    )
 
         elif cmd == "/stop":
             await self.send("🛑 <b>Shutdown requested.</b> Bot will stop gracefully.")
