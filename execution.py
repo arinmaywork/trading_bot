@@ -369,6 +369,7 @@ class OrderExecutor:
         quantity: int,
         tag: str = "",
         limit_price: float = 0.0,
+        product_type: str = "",
     ) -> Tuple[Optional[str], Optional[float], Optional[str]]:
         """
         Place one order slice via kite.place_order.
@@ -406,13 +407,16 @@ class OrderExecutor:
                     "Order skipped to avoid invalid LIMIT order."
                 )
 
+            # R-11: use signal's product_type ("MIS" or "CNC") if provided;
+            # fall back to KiteConfig.PRODUCT (default "MIS").
+            _product = product_type if product_type in ("MIS", "CNC") else cfg.PRODUCT
             return self._kite.place_order(
                 variety=cfg.ORDER_VARIETY,
                 exchange=cfg.EXCHANGE,
                 tradingsymbol=symbol,
                 transaction_type=kite_transaction,
                 quantity=quantity,
-                product=cfg.PRODUCT,
+                product=_product,
                 order_type=cfg.ORDER_TYPE,
                 price=order_price,
                 tag=tag[:20] if tag else "SENTISTACK",
@@ -615,6 +619,7 @@ class OrderExecutor:
                     quantity=order_slice.quantity,
                     tag=tag,
                     limit_price=signal.current_price,
+                    product_type=getattr(signal, "product_type", ""),
                 )
 
             if order_id:

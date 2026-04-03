@@ -1,0 +1,62 @@
+# ── SentiStack V2 — Docker Compose ──────────────────────────────────────────
+# Runs the trading bot + Redis on a single GCP VM.
+#
+# Start:  docker compose up -d
+# Stop:   docker compose down
+# Logs:   docker compose logs -f bot
+# Restart just bot: docker compose restart bot
+
+version: "3.9"
+
+services:
+
+  # ── Redis (feature store + tick stream) ──────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: sentistack_redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --save 900 1
+      --save 300 10
+      --appendonly no
+    volumes:
+      - redis_data:/data
+    ports:
+      - "127.0.0.1:6379:6379"   # Bind only to localhost — never expose publicly
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── SentiStack Trading Bot ────────────────────────────────────────────────
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sentistack_bot
+    image: sentistack:latest
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env                     # All secrets live here — never committed to git
+    environment:
+      - REDIS_HOST=redis         # Override: use Docker service name, not localhost
+      - REDIS_PORT=6379
+    volumes:
+      - ./logs:/app/logs         # Persist logs to host for easy inspection
+      - ./.kite_token:/app/.kite_token   # Persist Kite access token across restarts
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+volumes:
+  redis_data:
+    driver: local

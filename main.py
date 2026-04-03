@@ -59,6 +59,7 @@ from kiteconnect import exceptions as KiteExceptions
 from alternative_data import AlternativeDataPipeline
 from logbook import Logbook
 from telegram_controller import TelegramController, BotState, TradingMode
+from telegram_log_handler import TelegramLogHandler
 from agent_pipeline import AgentPipeline
 from config import settings
 from data_ingestion import AsyncKiteTickerWrapper, CandleAggregator
@@ -412,6 +413,18 @@ async def strategy_loop(
                 await asyncio.sleep(60)
             continue
 
+        # ── Task heartbeat — update every cycle so /tasks shows health ───────
+        if bot_state is not None:
+            _hb = bot_state.task_heartbeats.setdefault("strategy_loop", {"cycles": 0, "errors": 0})
+            _hb["last_beat"] = time.time()
+            _hb["cycles"]   += 1
+
+        # ---- R-11: Sync paper capital from BotState if changed via /capital ----
+        if settings.kite.PAPER_TRADE and bot_state is not None:
+            _paper_cap = bot_state.paper_capital
+            if abs(_paper_cap - risk_manager._capital) > 1.0:
+                risk_manager.update_capital(_paper_cap)
+
         # ---- Push latest macro + geo signals to universe engine ----
         logger.info("Strategy loop [cycle %d]: updating macro signals...", cycle_num)
         universe_engine.update_macro_signals(
@@ -604,21 +617,45 @@ async def strategy_loop(
                             else kite.TRANSACTION_TYPE_BUY
                         )
                         close_qty = abs(qty)
+
+                        # R-10 FIX: Zerodha MARKET orders require a non-zero price for
+                        # the "protection amount" check (NSE circuit-breaker guard).
+                        # Sending price=0 (the default when omitted) causes:
+                        #   "Market order cannot be placed with protection amount 0"
+                        # Solution: use a LIMIT order with a wide ±2% buffer from the
+                        # current LTP.  At ±2% the order always fills at market price
+                        # while satisfying Zerodha's price validation.
+                        _ltp = ltp_map.get(sym, 0.0)
+                        if _ltp <= 0:
+                            # LTP unavailable — log and skip; alert user to close manually.
+                            raise ValueError(
+                                f"LTP unavailable for {sym} — cannot compute limit price."
+                            )
+                        _SQ_BUFFER = 0.02   # 2% — wide enough to always fill
+                        if close_direction == kite.TRANSACTION_TYPE_BUY:
+                            _sq_price = round(_ltp * (1.0 + _SQ_BUFFER), 1)
+                        else:
+                            _sq_price = round(_ltp * (1.0 - _SQ_BUFFER), 1)
+
                         async with rate_limiter.order_slot():
                             sq_id = await loop.run_in_executor(
                                 None,
-                                lambda s=sym, d=close_direction, q=close_qty: kite.place_order(
+                                lambda s=sym, d=close_direction, q=close_qty, p=_sq_price: kite.place_order(
                                     variety=settings.kite.ORDER_VARIETY,
                                     exchange=settings.kite.EXCHANGE,
                                     tradingsymbol=s,
                                     transaction_type=d,
                                     quantity=q,
                                     product=settings.kite.PRODUCT,
-                                    order_type="MARKET",   # MARKET for guaranteed fill
+                                    order_type=kite.ORDER_TYPE_LIMIT,  # LIMIT avoids price=0 rejection
+                                    price=p,
                                     tag="SS_SQUAREOFF",
                                 )
                             )
-                        logger.info("Square-off placed: %s qty=%d → order_id=%s", sym, close_qty, sq_id)
+                        logger.info(
+                            "Square-off placed: %s qty=%d @ ₹%.1f (ltp=%.1f) → order_id=%s",
+                            sym, close_qty, _sq_price, _ltp, sq_id,
+                        )
                     except Exception as sq_exc:
                         logger.error("Square-off FAILED for %s: %s", sym, sq_exc)
                         await telegram.send(
@@ -662,6 +699,20 @@ async def strategy_loop(
                     )
                 if sig.is_actionable:
                     actionable_count += 1
+
+                    # ── Telegram trade guards (/nobuy, /nosell) ────────────
+                    if (bot_state and bot_state.no_new_buys
+                            and sig.direction == TradeDirection.BUY):
+                        logger.info(
+                            "TradeGuard[nobuy]: skipping BUY signal for %s", symbol
+                        )
+                        continue
+                    if (bot_state and bot_state.no_new_sells
+                            and sig.direction == TradeDirection.SELL):
+                        logger.info(
+                            "TradeGuard[nosell]: skipping SELL signal for %s", symbol
+                        )
+                        continue
 
                     # ── Cooldown guard ─────────────────────────────────────
                     now_mono = time.monotonic()
@@ -715,6 +766,9 @@ async def strategy_loop(
                 raise
             except Exception as exc:
                 logger.error("Signal error [%s]: %s", symbol, exc, exc_info=True)
+                if bot_state is not None:
+                    _hb = bot_state.task_heartbeats.setdefault("strategy_loop", {"cycles": 0, "errors": 0, "last_beat": time.time()})
+                    _hb["errors"] += 1
 
         if cycle_num % 10 == 1:
             sample = active_symbols[0] if active_symbols else "N/A"
@@ -824,6 +878,18 @@ async def main(kite: KiteConnect, access_token: str) -> None:
     # Register the live kite instance so /login and /token commands can
     # hot-swap the daily access token without restarting the bot.
     tg_controller.set_kite(kite, settings.kite.API_SECRET)
+    # R-11: Register logbook so /pnl command can pull today's trade data.
+    tg_controller.set_logbook(logbook)
+    # Wire Telegram ERROR log forwarding — any ERROR/CRITICAL log line is
+    # sent to the Telegram chat automatically (rate-limited to 1 per 30 s).
+    _tg_log_handler = TelegramLogHandler(
+        token=settings.telegram.BOT_TOKEN,
+        chat_id=str(settings.telegram.CHAT_ID),
+        cooldown=30.0,
+    )
+    _tg_log_handler.setLevel(logging.ERROR)
+    logging.getLogger().addHandler(_tg_log_handler)
+    logger.info("TelegramLogHandler installed — ERROR logs will be forwarded to Telegram.")
     strategy_engine = StrategyEngine(redis_client, risk_manager, ml_engine)
     executor        = OrderExecutor(kite, rate_limiter, telegram)
 
@@ -948,10 +1014,18 @@ async def main(kite: KiteConnect, access_token: str) -> None:
                     total_calls = sum(v["calls"] for v in stats.values())
                     if total_calls % 10 == 0:
                         logger.info("Model pool stats: %s", stats)
+                # Heartbeat ping (inside try block)
+                if bot_state is not None:
+                    _shb = bot_state.task_heartbeats.setdefault("sentiment_loop", {"cycles": 0, "errors": 0})
+                    _shb["last_beat"] = time.time()
+                    _shb["cycles"]   += 1
             except asyncio.CancelledError: raise
             except Exception as exc:
                 logger.error("Sentiment loop error: %s", exc, exc_info=True)
                 interval = 300
+                if bot_state is not None:
+                    _shb = bot_state.task_heartbeats.setdefault("sentiment_loop", {"cycles": 0, "errors": 0, "last_beat": time.time()})
+                    _shb["errors"] += 1
             await asyncio.sleep(interval)
 
     candle_task    = asyncio.create_task(candle_agg.run(), name="candle_agg")

@@ -90,6 +90,7 @@ class TradeLogRow:
     vwap:             float
     order_id:         str
     mode:             str    # "PAPER" or "LIVE"
+    product_type:     str    # "MIS" (intraday) or "CNC" (delivery/swing)
     success:          bool
     error:            str
     # ── Full reasoning chain ──────────────────────────────────────────
@@ -106,7 +107,7 @@ TRADE_HEADERS = [
     "sentiment_class", "sentiment_score",
     "gri", "gri_level", "geo_alpha_mult", "geo_kelly_mult",
     "busseti_f", "mlofi", "aflow_ratio", "vol", "vwap",
-    "order_id", "mode", "success", "error",
+    "order_id", "mode", "product_type", "success", "error",
     "sentiment_rationale", "risk_context", "gpr_normalised", "signal_why",
 ]
 
@@ -283,6 +284,7 @@ class Logbook:
             vwap           = round(signal.vwap, 2),
             order_id       = order_ids or "N/A",
             mode           = mode,
+            product_type   = getattr(signal, "product_type", "MIS"),
             success        = report.success,
             error          = (report.error or "")[:200],
             sentiment_rationale = getattr(signal, "rationale", "")[:400],
@@ -444,3 +446,152 @@ class Logbook:
             "total_signals":   len(self._signals),
             "actionable":      sum(1 for s in self._signals if s.is_actionable),
         }
+
+    # ── Daily P&L Report ─────────────────────────────────────────────────
+
+    def get_pnl_report(self) -> str:
+        """
+        Build a detailed P&L report for today's trades.
+
+        Strategy:
+          • Group trades by symbol.
+          • Match BUY qty against subsequent SELL qty (FIFO) to compute
+            realised P&L per round-trip.
+          • Compute transaction costs per trade: brokerage + STT + exchange fee.
+          • Report gross P&L, total costs, and net P&L per symbol.
+          • Separate MIS (intraday) vs CNC (swing/delivery) sections.
+          • Any unmatched BUY positions are counted as open (unrealised).
+
+        Returns a plain-text Telegram-safe report (no markdown headers).
+        """
+        from config import settings  # local import to avoid circular
+
+        cfg = settings.strategy
+        trades = [t for t in self._trades if t.success]
+
+        if not trades:
+            return "No trades recorded today."
+
+        # ── per-trade cost helper ─────────────────────────────────────────
+        def _trade_cost(t: TradeLogRow) -> float:
+            order_val = t.fill_price * t.qty
+            brokerage = min(cfg.BROKERAGE_PER_ORDER, cfg.BROKERAGE_PCT * order_val)
+            exchange  = cfg.EXCHANGE_CHARGE_RATE * order_val
+            if t.direction == "SELL":
+                # STT on sell-side only for MIS; both sides for CNC
+                stt_rate = 0.001 if t.product_type == "CNC" else cfg.STT_INTRADAY_SELL_RATE
+                stt = stt_rate * order_val
+            else:
+                # CNC buy-side STT (0.1%)
+                stt = (0.001 * order_val) if t.product_type == "CNC" else 0.0
+            return round(brokerage + exchange + stt, 2)
+
+        # ── separate MIS / CNC ───────────────────────────────────────────
+        mis_trades = [t for t in trades if getattr(t, "product_type", "MIS") == "MIS"]
+        cnc_trades = [t for t in trades if getattr(t, "product_type", "MIS") == "CNC"]
+
+        def _symbol_pnl(sym_trades: List[TradeLogRow]) -> Dict[str, Any]:
+            """FIFO matching of BUY→SELL within a symbol group."""
+            buys:  List[TradeLogRow] = [t for t in sym_trades if t.direction == "BUY"]
+            sells: List[TradeLogRow] = [t for t in sym_trades if t.direction == "SELL"]
+
+            buy_queue  = [(t.qty, t.fill_price) for t in buys]   # (qty, price)
+            sell_queue = [(t.qty, t.fill_price) for t in sells]
+
+            gross_pnl = 0.0
+            matched   = 0
+
+            bi = 0
+            si = 0
+            buy_rem  = buy_queue[bi][0]  if buy_queue  else 0
+            sell_rem = sell_queue[si][0] if sell_queue else 0
+
+            while bi < len(buy_queue) and si < len(sell_queue):
+                trade_qty = min(buy_rem, sell_rem)
+                gross_pnl += trade_qty * (sell_queue[si][1] - buy_queue[bi][1])
+                matched   += trade_qty
+                buy_rem   -= trade_qty
+                sell_rem  -= trade_qty
+                if buy_rem  == 0:
+                    bi += 1
+                    buy_rem  = buy_queue[bi][0]  if bi < len(buy_queue)  else 0
+                if sell_rem == 0:
+                    si += 1
+                    sell_rem = sell_queue[si][0] if si < len(sell_queue) else 0
+
+            total_cost  = sum(_trade_cost(t) for t in sym_trades)
+            open_qty    = sum(t.qty for t in buys) - sum(t.qty for t in sells)
+            return {
+                "gross":     round(gross_pnl, 2),
+                "cost":      round(total_cost, 2),
+                "net":       round(gross_pnl - total_cost, 2),
+                "trades":    len(sym_trades),
+                "open_qty":  max(open_qty, 0),
+            }
+
+        def _section(section_trades: List[TradeLogRow], label: str) -> List[str]:
+            if not section_trades:
+                return [f"  No {label} trades today."]
+
+            symbols: Dict[str, List[TradeLogRow]] = {}
+            for t in section_trades:
+                symbols.setdefault(t.symbol, []).append(t)
+
+            lines = []
+            total_gross = 0.0
+            total_cost  = 0.0
+            total_net   = 0.0
+
+            for sym, sym_trades in sorted(symbols.items()):
+                r = _symbol_pnl(sym_trades)
+                total_gross += r["gross"]
+                total_cost  += r["cost"]
+                total_net   += r["net"]
+                open_tag = f"  [{r['open_qty']} open]" if r["open_qty"] > 0 else ""
+                lines.append(
+                    f"  {sym:<15} gross=₹{r['gross']:>+9.2f}  "
+                    f"cost=₹{r['cost']:>7.2f}  net=₹{r['net']:>+9.2f}  "
+                    f"({r['trades']} trades){open_tag}"
+                )
+
+            lines.append(
+                f"  {'TOTAL':<15} gross=₹{total_gross:>+9.2f}  "
+                f"cost=₹{total_cost:>7.2f}  net=₹{total_net:>+9.2f}"
+            )
+            return lines
+
+        now   = _ist_now()
+        lines = [
+            "=" * 60,
+            f"  DAILY P&L REPORT — {now.strftime('%d %b %Y, %H:%M IST')}",
+            "=" * 60,
+            "",
+            f"── MIS (Intraday) — {len(mis_trades)} trades ─────────────────",
+        ]
+        lines += _section(mis_trades, "MIS")
+
+        lines += [
+            "",
+            f"── CNC (Swing/Delivery) — {len(cnc_trades)} trades ──────────",
+        ]
+        lines += _section(cnc_trades, "CNC")
+
+        # ── Grand total ───────────────────────────────────────────────────
+        all_cost  = sum(_trade_cost(t) for t in trades)
+        all_gross = 0.0
+        symbols_all: Dict[str, List[TradeLogRow]] = {}
+        for t in trades:
+            symbols_all.setdefault(t.symbol, []).append(t)
+        for sym_trades in symbols_all.values():
+            all_gross += _symbol_pnl(sym_trades)["gross"]
+
+        lines += [
+            "",
+            "── GRAND TOTAL ───────────────────────────────────────────────",
+            f"  Gross P&L : ₹{all_gross:>+,.2f}",
+            f"  Total Cost: ₹{all_cost:>,.2f}",
+            f"  Net P&L   : ₹{all_gross - all_cost:>+,.2f}",
+            f"  Trades    : {len(trades)}  (MIS={len(mis_trades)}, CNC={len(cnc_trades)})",
+            "=" * 60,
+        ]
+        return "\n".join(lines)

@@ -109,6 +109,17 @@ class BotState:
     active_symbols: int          = 0
     gemini_working: bool         = False
     last_update:    str          = ""
+    paper_capital:  float        = field(
+        default_factory=lambda: float(
+            __import__("os").getenv("TOTAL_CAPITAL", "500000")
+        )
+    )
+    # ── Trading guards set via Telegram ──────────────────────────────────
+    no_new_buys:    bool         = False   # /nobuy  — block new BUY entries
+    no_new_sells:   bool         = False   # /nosell — block new SELL/short entries
+    # ── Task health — updated by each background task every cycle ────────
+    task_heartbeats: dict        = field(default_factory=dict)
+    # { task_name: {"last_beat": float, "cycles": int, "errors": int} }
 
     def update(self, **kwargs) -> None:
         for k, v in kwargs.items():
@@ -145,6 +156,8 @@ class TelegramController:
         self._kite             = None
         self._api_secret       = ""
         self._token_cache_file = Path(__file__).parent / ".kite_token"
+        # Logbook reference — populated by main.py via set_logbook()
+        self._logbook          = None
 
     # ── Token hot-swap ────────────────────────────────────────────────────
 
@@ -162,6 +175,13 @@ class TelegramController:
         self._token_cache_file = token_cache_file or (
             Path(__file__).parent / ".kite_token"
         )
+
+    def set_logbook(self, logbook: Any) -> None:
+        """
+        Register the Logbook instance so /pnl can pull today's trade data.
+        Call this once from main.py after the logbook is initialised.
+        """
+        self._logbook = logbook
 
     def _save_token_cache(self, token: str) -> None:
         try:
@@ -280,6 +300,9 @@ class TelegramController:
             f"{'─' * 34}\n"
             f"📡 <b>Signals today:</b> {s.signals_today}\n"
             f"💼 <b>Trades today:</b>  {s.trades_today}\n"
+            f"{'─' * 34}\n"
+            f"🚦 <b>Guards:</b>        "
+            f"{'🚫BUY ' if s.no_new_buys else ''}{'🚫SELL ' if s.no_new_sells else ''}{'None' if not s.no_new_buys and not s.no_new_sells else ''}\n"
             f"🕐 <b>Last update:</b>   {s.last_update}\n"
         )
 
@@ -290,7 +313,6 @@ class TelegramController:
 
         if cmd in ("/start", "/help"):
             await self.send(
-                # B-13 FIX: was a plain string literal "{'─' * 28}" not an f-string
                 f"🤖 <b>SentiStack V2 Commands</b>\n"
                 f"{'─' * 28}\n"
                 "/mode — Change trading mode\n"
@@ -298,6 +320,19 @@ class TelegramController:
                 "/pause — Pause order execution\n"
                 "/resume — Resume order execution\n"
                 "/stop — Graceful shutdown\n"
+                f"{'─' * 28}\n"
+                "🚦 <b>Trade Guards</b>\n"
+                "/nobuy — Block all new BUY orders\n"
+                "/okbuy — Re-enable BUY orders\n"
+                "/nosell — Block all new SELL/short orders\n"
+                "/oksell — Re-enable SELL orders\n"
+                f"{'─' * 28}\n"
+                "🔧 <b>Health &amp; Monitoring</b>\n"
+                "/tasks — Background task heartbeat status\n"
+                f"{'─' * 28}\n"
+                "📊 <b>P&amp;L &amp; Capital</b>\n"
+                "/pnl — Today's P&amp;L statement (MIS + CNC)\n"
+                "/capital &lt;amount&gt; — Update paper trade capital\n"
                 f"{'─' * 28}\n"
                 "🔑 <b>Daily Token Refresh (no restart needed)</b>\n"
                 "/login — Get today's Zerodha login URL\n"
@@ -391,6 +426,110 @@ class TelegramController:
                         f"(it's valid for only ~2 minutes after login). "
                         f"Send /login to try again."
                     )
+
+        elif cmd == "/nobuy":
+            self._state.no_new_buys = True
+            await self.send(
+                "🚫 <b>New BUY orders blocked.</b>\n"
+                "The bot will continue monitoring and can still close existing SELL positions.\n"
+                "Send /okbuy to re-enable BUY orders."
+            )
+            logger.info("no_new_buys flag SET via Telegram.")
+
+        elif cmd == "/okbuy":
+            self._state.no_new_buys = False
+            await self.send("✅ <b>BUY orders re-enabled.</b> Bot will resume buying on strong signals.")
+            logger.info("no_new_buys flag CLEARED via Telegram.")
+
+        elif cmd == "/nosell":
+            self._state.no_new_sells = True
+            await self.send(
+                "🚫 <b>New SELL/short orders blocked.</b>\n"
+                "Send /oksell to re-enable SELL orders."
+            )
+            logger.info("no_new_sells flag SET via Telegram.")
+
+        elif cmd == "/oksell":
+            self._state.no_new_sells = False
+            await self.send("✅ <b>SELL orders re-enabled.</b>")
+            logger.info("no_new_sells flag CLEARED via Telegram.")
+
+        elif cmd == "/tasks":
+            # ── Background task health status ─────────────────────────────
+            hb = self._state.task_heartbeats
+            if not hb:
+                await self.send("⏳ No task heartbeats recorded yet — bot may still be starting up.")
+            else:
+                now_ts = time.time()
+                lines  = [
+                    "🔧 <b>Background Task Health</b>",
+                    f"{'─' * 32}",
+                ]
+                for name, info in sorted(hb.items()):
+                    age     = now_ts - info.get("last_beat", 0)
+                    cycles  = info.get("cycles", 0)
+                    errors  = info.get("errors", 0)
+                    if age < 120:
+                        icon = "🟢"
+                    elif age < 600:
+                        icon = "🟡"
+                    else:
+                        icon = "🔴"
+                    age_str = (
+                        f"{int(age)}s ago" if age < 3600
+                        else f"{int(age/3600)}h ago"
+                    )
+                    lines.append(
+                        f"{icon} <b>{name}</b>\n"
+                        f"   Last beat: {age_str} | Cycles: {cycles} | Errors: {errors}"
+                    )
+                lines.append(f"{'─' * 32}")
+                lines.append(f"🕐 <i>{_fmt_time()}</i>")
+                await self.send("\n".join(lines))
+
+        elif cmd == "/pnl":
+            # ── Daily P&L statement ───────────────────────────────────────
+            if self._logbook is None:
+                await self.send("⚠️ Logbook not yet initialised — please try again in a moment.")
+            else:
+                try:
+                    report = self._logbook.get_pnl_report()
+                    # Telegram message limit is ~4096 chars; split if needed
+                    if len(report) <= 4000:
+                        await self.send(f"<pre>{report}</pre>")
+                    else:
+                        chunk_size = 3900
+                        for i in range(0, len(report), chunk_size):
+                            await self.send(f"<pre>{report[i:i+chunk_size]}</pre>")
+                            await asyncio.sleep(0.3)
+                except Exception as exc:
+                    logger.error("P&L report error: %s", exc, exc_info=True)
+                    await self.send(f"❌ Could not generate P&L report: <code>{exc}</code>")
+
+        elif cmd == "/capital":
+            # ── Update paper trade capital ────────────────────────────────
+            parts = text.strip().split(None, 1)
+            raw   = parts[1].strip() if len(parts) > 1 else ""
+            # Strip currency symbols and commas (e.g. "₹5,00,000" → "500000")
+            raw = raw.replace("₹", "").replace(",", "").strip()
+            try:
+                new_capital = float(raw)
+                if new_capital <= 0:
+                    raise ValueError("Capital must be positive")
+                self._state.paper_capital = new_capital
+                await self.send(
+                    f"✅ <b>Paper capital updated</b>\n"
+                    f"New capital: <b>₹{new_capital:,.2f}</b>\n"
+                    f"This takes effect on the next strategy cycle.\n"
+                    f"(Live mode capital is set via TOTAL_CAPITAL env var.)"
+                )
+                logger.info("Paper capital updated to ₹%.2f via Telegram.", new_capital)
+            except (ValueError, IndexError):
+                await self.send(
+                    "⚠️ Usage: <code>/capital &lt;amount&gt;</code>\n"
+                    "Example: <code>/capital 500000</code>\n"
+                    "Strips ₹ and commas automatically."
+                )
 
         elif cmd == "/stop":
             await self.send("🛑 <b>Shutdown requested.</b> Bot will stop gracefully.")

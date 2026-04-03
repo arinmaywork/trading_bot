@@ -1,0 +1,55 @@
+# ============================================================================
+# SentiStack V2 — systemd service unit
+# ============================================================================
+# Manages the Docker Compose stack as a system service.
+#
+# Installed automatically by setup-gcp.sh.
+# Manual install:
+#   sudo cp sentistack.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now sentistack
+#
+# Commands:
+#   sudo systemctl start   sentistack
+#   sudo systemctl stop    sentistack
+#   sudo systemctl restart sentistack
+#   sudo systemctl status  sentistack
+#   sudo journalctl -u sentistack -f        # live logs
+# ============================================================================
+
+[Unit]
+Description=SentiStack V2 — NSE Algo Trading Bot
+Documentation=https://github.com/YOUR_USERNAME/YOUR_REPO
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/sentistack
+
+# Pull latest image and start
+ExecStart=/usr/bin/docker compose up -d --build
+ExecStop=/usr/bin/docker compose down
+ExecReload=/usr/bin/docker compose restart bot
+
+# Restart policy: restart the service if it crashes (max 3 times in 5 minutes)
+Restart=on-failure
+RestartSec=30s
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+# Safety: kill any leftover containers on stop
+KillMode=none
+
+# Environment (Docker reads .env automatically from WorkingDirectory)
+Environment="COMPOSE_PROJECT_NAME=sentistack"
+
+# Logs go to journald — view with: journalctl -u sentistack -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentistack
+
+[Install]
+WantedBy=multi-user.target

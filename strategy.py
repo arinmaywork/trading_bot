@@ -110,6 +110,8 @@ class SignalState:
     geo_kelly_multiplier: float
     is_decayed:           bool
     rationale:            str
+    # R-11: CNC/MIS hybrid — set by StrategyEngine based on confidence + time
+    product_type:         str = "MIS"   # "MIS" (intraday) or "CNC" (delivery/swing)
 
     @property
     def is_actionable(self) -> bool:
@@ -323,6 +325,12 @@ class RiskManager:
         self._capital        = capital
         self._cfg            = settings.strategy
         self._baseline_vols: Dict[str, float] = {}
+
+    def update_capital(self, capital: float) -> None:
+        """Update the trading capital used for position sizing."""
+        if capital > 0:
+            self._capital = capital
+            logger.info("RiskManager capital updated to ₹%.2f", capital)
 
     def _update_baseline_vol(self, symbol: str, vol: float) -> None:
         prev = self._baseline_vols.get(symbol, vol)
@@ -601,6 +609,26 @@ class StrategyEngine:
             f"| {size_reason}"
         )
 
+        # ── R-11: CNC / MIS classification ─────────────────────────────────
+        # CNC (delivery/swing) requires:
+        #   • Signal not decayed
+        #   • Non-flat direction
+        #   • ML confidence ≥ CNC_MIN_CONFIDENCE (default 0.75)
+        #   • |alpha| ≥ CNC_ALPHA_THRESHOLD (default 0.8 %)
+        #   • Entry before CNC_ENTRY_CUTOFF_HOUR IST (default 13:00)
+        _ist_hour = datetime.now(timezone(timedelta(hours=5, minutes=30))).hour
+        _cfg_s = settings.strategy
+        if (
+            not is_decayed
+            and direction != TradeDirection.FLAT
+            and signal_out.confidence >= _cfg_s.CNC_MIN_CONFIDENCE
+            and abs(ml_signal) >= _cfg_s.CNC_ALPHA_THRESHOLD
+            and _ist_hour < _cfg_s.CNC_ENTRY_CUTOFF_HOUR
+        ):
+            _product_type = "CNC"
+        else:
+            _product_type = "MIS"
+
         return SignalState(
             symbol               = symbol,
             timestamp            = datetime.now(timezone.utc),
@@ -628,4 +656,5 @@ class StrategyEngine:
             geo_kelly_multiplier = gri.kelly_multiplier,
             is_decayed           = is_decayed,
             rationale            = rationale,
+            product_type         = _product_type,
         )

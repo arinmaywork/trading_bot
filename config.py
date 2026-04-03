@@ -264,6 +264,24 @@ class StrategyConfig:
     SQUARE_OFF_HOUR_IST:         int   = 15
     SQUARE_OFF_MINUTE_IST:       int   = 15
 
+    # ---------------------------------------------------------------------------
+    # R-11: CNC / MIS Hybrid Strategy
+    # ---------------------------------------------------------------------------
+    # Signals with high ML confidence AND generated before CNC_ENTRY_CUTOFF_HOUR
+    # are classified as CNC (delivery/swing, held overnight). All others → MIS.
+    #
+    # CNC benefits: no auto-square risk, no need to trade under time pressure.
+    # CNC costs:    higher STT (0.1% both sides vs 0.025% sell-only for MIS),
+    #               overnight gap risk, capital locked for multiple days.
+    #
+    # CNC_CAPITAL_PCT: fraction of TOTAL_CAPITAL reserved for CNC swing positions.
+    # The remaining fraction is used for MIS intraday positions.
+    CNC_MIN_CONFIDENCE:    float = 0.75    # ML confidence required to qualify as CNC
+    CNC_ALPHA_THRESHOLD:   float = 0.008   # Stronger alpha required for overnight risk
+    CNC_CAPITAL_PCT:       float = 0.40    # 40% of capital reserved for CNC swing
+    CNC_ENTRY_CUTOFF_HOUR: int   = 13      # Only enter CNC positions before 1 PM IST
+    CNC_MAX_HOLD_DAYS:     int   = 5       # Auto-exit CNC positions after this many days
+
 
 # ---------------------------------------------------------------------------
 # Logging
