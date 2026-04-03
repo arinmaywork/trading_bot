@@ -14,26 +14,35 @@
 #   5. Prints next steps (add .env file, whitelist the static IP)
 #
 # Prerequisites (do these in GCP Console BEFORE running this script):
-#   a) Create a VM:
+#
+#   IMPORTANT — Free Tier constraints:
+#     • Machine type: e2-micro ONLY (1 vCPU, 1 GB RAM)
+#     • Region: us-central1, us-east1, or us-west1 ONLY
+#     • Disk: 30 GB pd-standard max (use --boot-disk-type=pd-standard)
+#     • Static IP: FREE while VM is running; billed if VM is stopped.
+#       → NEVER stop the VM — just restart it.
+#
+#   a) Create a VM (free tier — do NOT change machine type or region):
 #        gcloud compute instances create sentistack \
-#          --machine-type=e2-small \
-#          --zone=asia-south1-a \
+#          --machine-type=e2-micro \
+#          --zone=us-central1-a \
 #          --image-family=ubuntu-2204-lts \
 #          --image-project=ubuntu-os-cloud \
-#          --boot-disk-size=20GB \
+#          --boot-disk-size=30GB \
+#          --boot-disk-type=pd-standard \
 #          --tags=sentistack
 #
 #   b) Reserve a STATIC external IP (crucial for Zerodha whitelist):
-#        gcloud compute addresses create sentistack-ip --region=asia-south1
+#        gcloud compute addresses create sentistack-ip --region=us-central1
 #        gcloud compute instances delete-access-config sentistack \
-#          --access-config-name="External NAT" --zone=asia-south1-a
+#          --access-config-name="External NAT" --zone=us-central1-a
 #        gcloud compute instances add-access-config sentistack \
-#          --zone=asia-south1-a \
+#          --zone=us-central1-a \
 #          --address=$(gcloud compute addresses describe sentistack-ip \
-#                       --region=asia-south1 --format='get(address)')
+#                       --region=us-central1 --format='get(address)')
 #
 #   c) SSH into the VM:
-#        gcloud compute ssh sentistack --zone=asia-south1-a
+#        gcloud compute ssh sentistack --zone=us-central1-a
 #
 # ============================================================================
 set -euo pipefail
@@ -45,6 +54,19 @@ SERVICE_FILE="/etc/systemd/system/sentistack.service"
 echo "============================================================"
 echo "  SentiStack V2 — GCP VM Setup"
 echo "============================================================"
+
+# ── 0. Swap (critical on e2-micro — only 1 GB RAM) ──────────────────────────
+echo "[0/6] Setting up 2 GB swap space..."
+if [ ! -f /swapfile ]; then
+    sudo fallocate -l 2G /swapfile
+    sudo chmod 600 /swapfile
+    sudo mkswap /swapfile
+    sudo swapon /swapfile
+    echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+    echo "  Swap created and enabled."
+else
+    echo "  Swap already exists — skipping."
+fi
 
 # ── 1. System updates ────────────────────────────────────────────────────────
 echo "[1/6] Updating system packages..."

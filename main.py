@@ -110,6 +110,12 @@ class TokenManager:
         self._api_key    = api_key
         self._api_secret = api_secret
         self._kite       = KiteConnect(api_key=api_key)
+        self._tg_offset  = 0   # Telegram update offset consumed during headless startup
+
+    @property
+    def tg_offset(self) -> int:
+        """Last Telegram update_id + 1 consumed during headless startup polling."""
+        return self._tg_offset
 
     def _load_cached_token(self) -> Optional[str]:
         if not TOKEN_CACHE_FILE.exists():
@@ -188,6 +194,129 @@ class TokenManager:
 
         raise RuntimeError("Authentication failed after 3 attempts.")
 
+    def _telegram_oauth_flow(self) -> str:
+        """
+        Headless-server OAuth flow.
+        Sends the Zerodha login URL to the configured Telegram chat and then
+        long-polls for a /token <request_token> command.  No stdin, no browser.
+        Stores the highest Telegram update_id seen in self._tg_offset so that
+        the TelegramController's poll loop can skip these already-processed
+        messages when it starts up.
+        """
+        import requests as _requests
+
+        login_url = self._kite.login_url()
+        bot_tok   = settings.telegram.BOT_TOKEN
+        chat_id   = str(settings.telegram.CHAT_ID)
+        api_base  = f"https://api.telegram.org/bot{bot_tok}"
+
+        msg = (
+            "🔑 <b>SentiStack — Zerodha login required</b>\n"
+            "─────────────────────────────────────────\n"
+            "1️⃣  Open this link and log in:\n"
+            f"<code>{login_url}</code>\n\n"
+            "2️⃣  After login you'll be redirected to:\n"
+            "<code>http://127.0.0.1/?request_token=XXXXXXXX&amp;status=success</code>\n\n"
+            "3️⃣  Copy <b>only the request_token value</b> and send:\n"
+            "<code>/token XXXXXXXX</code>\n\n"
+            "⚠️  Do this before 9:15 AM IST — token expires at midnight."
+        )
+        try:
+            _requests.post(
+                f"{api_base}/sendMessage",
+                json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
+                timeout=15,
+            )
+            logger.info("Headless startup: login URL sent to Telegram. Waiting for /token …")
+        except Exception as exc:
+            logger.warning("Could not send Telegram message: %s", exc)
+
+        # Long-poll until we receive /token <request_token>
+        offset = 0
+        while True:
+            try:
+                resp = _requests.get(
+                    f"{api_base}/getUpdates",
+                    params={
+                        "offset":          offset,
+                        "timeout":         30,
+                        "allowed_updates": '["message"]',
+                    },
+                    timeout=40,
+                )
+                data = resp.json()
+            except Exception as exc:
+                logger.warning("Telegram poll error: %s — retrying in 5 s", exc)
+                time.sleep(5)
+                continue
+
+            for update in data.get("result", []):
+                uid  = update["update_id"]
+                offset = uid + 1          # advance window
+                if offset > self._tg_offset:
+                    self._tg_offset = offset
+
+                msg_obj = update.get("message", {})
+                text    = msg_obj.get("text", "").strip()
+
+                if not text.startswith("/token"):
+                    continue
+
+                parts = text.split(None, 1)
+                raw   = parts[1].strip() if len(parts) > 1 else ""
+                # Accept full redirect URL as well as bare request_token
+                if "request_token=" in raw:
+                    raw = raw.split("request_token=")[1].split("&")[0].strip()
+
+                if not raw:
+                    # Prompt again
+                    try:
+                        _requests.post(
+                            f"{api_base}/sendMessage",
+                            json={
+                                "chat_id":    chat_id,
+                                "text":       "⚠️ Please send the request_token: <code>/token XXXXXXXX</code>",
+                                "parse_mode": "HTML",
+                            },
+                            timeout=10,
+                        )
+                    except Exception:
+                        pass
+                    continue
+
+                logger.info("Headless startup: received request_token via Telegram — exchanging…")
+                try:
+                    session = self._kite.generate_session(raw, api_secret=self._api_secret)
+                    new_token = session["access_token"]
+                    try:
+                        _requests.post(
+                            f"{api_base}/sendMessage",
+                            json={
+                                "chat_id":    chat_id,
+                                "text":       "✅ <b>Token accepted!</b> SentiStack is starting up…",
+                                "parse_mode": "HTML",
+                            },
+                            timeout=10,
+                        )
+                    except Exception:
+                        pass
+                    return new_token
+                except Exception as exc:
+                    logger.error("Token exchange failed: %s", exc)
+                    try:
+                        _requests.post(
+                            f"{api_base}/sendMessage",
+                            json={
+                                "chat_id":    chat_id,
+                                "text":       f"❌ Token exchange failed: {exc}\nPlease try /token again.",
+                                "parse_mode": "HTML",
+                            },
+                            timeout=10,
+                        )
+                    except Exception:
+                        pass
+                    # Keep polling — user will re-send
+
     def get_token(self) -> Tuple[KiteConnect, str]:
         env_tok = settings.kite.ACCESS_TOKEN
         if env_tok and self._validate_token(env_tok):
@@ -195,7 +324,13 @@ class TokenManager:
         cached = self._load_cached_token()
         if cached and self._validate_token(cached):
             return self._kite, cached
-        new_tok = self._run_oauth_flow()
+        # Need a fresh token.  Choose flow based on whether we have a terminal.
+        headless = not sys.stdin.isatty()
+        if headless:
+            logger.info("Headless server detected — using Telegram-based token flow.")
+            new_tok = self._telegram_oauth_flow()
+        else:
+            new_tok = self._run_oauth_flow()
         self._save_token(new_tok)
         if not self._validate_token(new_tok):
             raise RuntimeError("Newly generated token failed validation.")
@@ -844,7 +979,7 @@ async def strategy_loop(
 # ASYNC MAIN
 # ===========================================================================
 
-async def main(kite: KiteConnect, access_token: str) -> None:
+async def main(kite: KiteConnect, access_token: str, tg_offset: int = 0) -> None:
     shutdown = GracefulShutdown()
     shutdown.install_signal_handlers()
 
@@ -875,6 +1010,11 @@ async def main(kite: KiteConnect, access_token: str) -> None:
     logbook        = Logbook()
     bot_state      = BotState()
     tg_controller  = TelegramController(bot_state)
+    # If headless startup consumed some Telegram updates (e.g. the /token
+    # command), advance the poll offset so those messages are not re-processed.
+    if tg_offset > 0:
+        tg_controller._offset = tg_offset
+        logger.info("TelegramController offset seeded to %d from headless startup.", tg_offset)
     # Register the live kite instance so /login and /token commands can
     # hot-swap the daily access token without restarting the bot.
     tg_controller.set_kite(kite, settings.kite.API_SECRET)
@@ -1132,6 +1272,6 @@ if __name__ == "__main__":
         sys.exit(0)
     print("  Authentication OK — launching engine...\n")
     try:
-        asyncio.run(main(kite_i, acc_tok))
+        asyncio.run(main(kite_i, acc_tok, tg_offset=mgr.tg_offset))
     except KeyboardInterrupt:
         logger.info("Terminated.")

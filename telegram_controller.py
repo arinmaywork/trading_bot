@@ -390,7 +390,11 @@ class TelegramController:
                     "Send /login to get the login URL first."
                 )
             elif self._kite is None:
-                await self.send("⚠️ Kite not initialised — cannot refresh token yet.")
+                await self.send(
+                    "⏳ <b>Bot is still starting up</b> — the /token command during startup is "
+                    "handled automatically.\n"
+                    "Once running, you can use /login + /token to refresh the daily token.",
+                )
             else:
                 await self.send("🔄 Exchanging request_token for access token…")
                 try:
