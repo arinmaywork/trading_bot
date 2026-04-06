@@ -696,21 +696,26 @@ async def strategy_loop(
         _prev_gri = gri.composite
 
         # ---- Fetch open MIS positions (once per cycle, before signal loop) ----
-        try:
-            async with rate_limiter.request_slot():
-                pos_data = await loop.run_in_executor(None, kite.positions)
-            _open_positions = {}
-            for pos in pos_data.get("day", []):
-                if pos.get("product") == settings.kite.PRODUCT:
-                    sym = pos.get("tradingsymbol", "")
-                    qty = int(pos.get("quantity", 0))
-                    if sym:
-                        _open_positions[sym] = qty
-            if _open_positions:
-                logger.debug("Open MIS positions: %s", _open_positions)
-        except Exception as exc:
-            logger.warning("Positions fetch failed (skipping guard this cycle): %s", exc)
-            # Keep _open_positions from the previous cycle as a best-effort fallback
+        # PAPER_TRADE: skip the real Zerodha API call — positions are tracked
+        # in-memory from simulated fills.  Calling kite.positions() in paper
+        # mode would return real account positions (from manual trades), which
+        # could wrongly trigger the 3:15 PM square-off with real orders.
+        if not settings.kite.PAPER_TRADE:
+            try:
+                async with rate_limiter.request_slot():
+                    pos_data = await loop.run_in_executor(None, kite.positions)
+                _open_positions = {}
+                for pos in pos_data.get("day", []):
+                    if pos.get("product") == settings.kite.PRODUCT:
+                        sym = pos.get("tradingsymbol", "")
+                        qty = int(pos.get("quantity", 0))
+                        if sym:
+                            _open_positions[sym] = qty
+                if _open_positions:
+                    logger.debug("Open MIS positions: %s", _open_positions)
+            except Exception as exc:
+                logger.warning("Positions fetch failed (skipping guard this cycle): %s", exc)
+                # Keep _open_positions from the previous cycle as a best-effort fallback
 
         # ── R-10: Forced square-off at 3:15 PM IST ───────────────────────────
         # Zerodha auto-squares all open MIS positions at ~3:20 PM and charges
@@ -729,7 +734,7 @@ async def strategy_loop(
                 and _ist_now.minute >= settings.strategy.SQUARE_OFF_MINUTE_IST
             )
         )
-        if _past_squareoff:
+        if _past_squareoff and not settings.kite.PAPER_TRADE:
             open_to_close = {s: q for s, q in _open_positions.items() if q != 0}
             if open_to_close and not getattr(_strategy_loop_state, "squareoff_done_today", False):
                 logger.warning(
@@ -797,6 +802,25 @@ async def strategy_loop(
                             f"⚠️ <b>Square-off failed for {sym}</b>: {sq_exc}\n"
                             f"Please close manually in Kite immediately!"
                         )
+                _strategy_loop_state.squareoff_done_today = True
+
+        elif _past_squareoff and settings.kite.PAPER_TRADE:
+            # Paper mode: simulate square-off — clear in-memory positions and notify
+            open_to_close = {s: q for s, q in _open_positions.items() if q != 0}
+            if open_to_close and not getattr(_strategy_loop_state, "squareoff_done_today", False):
+                logger.warning(
+                    "⏰ [PAPER] 3:15 PM IST — simulating square-off for %d position(s): %s",
+                    len(open_to_close), list(open_to_close.keys()),
+                )
+                await telegram.send(
+                    f"⏰ <b>[PAPER] 3:15 PM Square-Off Simulated</b>\n"
+                    f"Clearing {len(open_to_close)} simulated MIS position(s).\n"
+                    + "\n".join(
+                        f"  {'SELL' if q > 0 else 'BUY'} {s} qty={abs(q)}"
+                        for s, q in open_to_close.items()
+                    )
+                )
+                _open_positions.clear()
                 _strategy_loop_state.squareoff_done_today = True
 
             # Skip all new signal entries after 3:15 PM — no new positions
@@ -890,6 +914,15 @@ async def strategy_loop(
                     # Set cooldown so this symbol is blocked for SIGNAL_COOLDOWN_S
                     if report.success:
                         _order_cooldowns[symbol] = time.monotonic()
+
+                        # In paper mode, track simulated positions in-memory so
+                        # the position guard works correctly between cycles.
+                        # (Real mode tracks via kite.positions() API call above.)
+                        if settings.kite.PAPER_TRADE:
+                            delta = report.total_quantity if sig.direction == TradeDirection.BUY else -report.total_quantity
+                            _open_positions[symbol] = _open_positions.get(symbol, 0) + delta
+                            if _open_positions[symbol] == 0:
+                                del _open_positions[symbol]
 
                     # B-04 FIX: log_trade() was never called — trades CSV was always empty
                     if logbook:
