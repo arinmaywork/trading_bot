@@ -72,9 +72,10 @@ MODE_DESCRIPTIONS = {
         "<i>No Gemini needed. Works even when quota is exhausted.</i>"
     ),
     TradingMode.PAPER_MONITOR: (
-        "👁 <b>Monitor Only</b>\n"
-        "Runs full pipeline but suppresses all order execution.\n"
-        "<i>Safe observation mode.</i>"
+        "👁 <b>Silent Observer</b>\n"
+        "Runs full analysis pipeline but places NO orders and logs NO trades.\n"
+        "<i>Use on holidays or for pure signal research. /pnl will show nothing.</i>\n"
+        "<i>For simulated fills with P&amp;L tracking, use GRI-Only or Full with PAPER_TRADE=true in .env.</i>"
     ),
 }
 

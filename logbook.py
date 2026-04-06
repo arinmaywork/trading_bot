@@ -168,7 +168,66 @@ class Logbook:
         self._trades:  List[TradeLogRow]  = []
         self._signals: List[SignalLogRow] = []
         self._session_start = _ist_now()
+        # Reload today's trades from CSV so /pnl works correctly after a restart.
+        self._load_today_trades()
         logger.info("Logbook initialised → %s", LOG_DIR.resolve())
+
+    def _load_today_trades(self) -> None:
+        """
+        Read today's trades CSV into self._trades on startup.
+        This ensures /pnl shows correct data even after a bot restart mid-day.
+        """
+        path = self._trade_path()
+        if not path.exists():
+            return
+        try:
+            with open(path, newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    try:
+                        trade = TradeLogRow(
+                            timestamp           = row.get("timestamp", ""),
+                            symbol              = row.get("symbol", ""),
+                            direction           = row.get("direction", ""),
+                            qty                 = int(row.get("qty", 0)),
+                            fill_price          = float(row.get("fill_price", 0)),
+                            expected_price      = float(row.get("expected_price", 0)),
+                            slippage_bps        = float(row.get("slippage_bps", 0)),
+                            alpha               = float(row.get("alpha", 0)),
+                            ml_signal           = float(row.get("ml_signal", 0)),
+                            ml_confidence       = float(row.get("ml_confidence", 0)),
+                            ml_is_fallback      = row.get("ml_is_fallback", "True") == "True",
+                            sentiment_class     = row.get("sentiment_class", ""),
+                            sentiment_score     = float(row.get("sentiment_score", 0)),
+                            gri                 = float(row.get("gri", 0)),
+                            gri_level           = row.get("gri_level", ""),
+                            geo_alpha_mult      = float(row.get("geo_alpha_mult", 1)),
+                            geo_kelly_mult      = float(row.get("geo_kelly_mult", 1)),
+                            busseti_f           = float(row.get("busseti_f", 0)),
+                            mlofi               = float(row.get("mlofi", 0)),
+                            aflow_ratio         = float(row.get("aflow_ratio", 0)),
+                            vol                 = float(row.get("vol", 0)),
+                            vwap                = float(row.get("vwap", 0)),
+                            order_id            = row.get("order_id", ""),
+                            mode                = row.get("mode", "PAPER"),
+                            product_type        = row.get("product_type", "MIS"),
+                            success             = row.get("success", "True") == "True",
+                            error               = row.get("error", ""),
+                            sentiment_rationale = row.get("sentiment_rationale", ""),
+                            risk_context        = row.get("risk_context", ""),
+                            gpr_normalised      = float(row.get("gpr_normalised", 0)),
+                            signal_why          = row.get("signal_why", ""),
+                        )
+                        self._trades.append(trade)
+                    except Exception:
+                        continue   # skip malformed rows
+            if self._trades:
+                logger.info(
+                    "Logbook: loaded %d trade(s) from today's CSV (%s).",
+                    len(self._trades), path.name,
+                )
+        except Exception as exc:
+            logger.warning("Logbook: could not load today's CSV: %s", exc)
 
     # ── File paths (rotate at midnight IST) ───────────────────────────────
 
