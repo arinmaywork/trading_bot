@@ -88,9 +88,15 @@ class _ModelSlot:
     display:    str         # human label for logs
     quality:    int         # 1-5; higher = better sentiment accuracy
     rpm_limit:  int         # requests per minute (free tier)
-    supports_system_instruction: bool = True   # False for Gemma models
+    rpd_limit:  int         # requests per day (free tier)
+    tier:       str         # "flash" | "pro" — determines when it's selected
+    supports_system_instruction: bool = True
     # runtime state
     calls_made:      int   = 0
+    calls_this_min:  int   = 0    # RPM window counter
+    min_window_start: float = 0.0  # start of current 60-second RPM window
+    rpd_today:       int   = 0    # calls made today (resets at midnight IST)
+    rpd_date:        str   = ""   # IST date string when rpd_today was last reset
     last_call_ts:    float = 0.0
     errors_429:      int   = 0
     cooldown_until:  float = 0.0   # epoch seconds
@@ -100,159 +106,234 @@ class ModelRotator:
     """
     Manages a priority-ordered pool of Gemini models.
 
-    Strategy:
-      • Quality-first: always tries highest-quality model first.
-      • Rate-aware: respects per-model RPM; backs off on 429.
-      • Budget-aware: distributes call budget across the NSE trading day
-        (09:15–15:30 IST, 375 min) so the pool never runs dry.
-      • GRI-adaptive: uses best models during high-risk / opening / close
-        windows; lighter models during calm mid-session.
+    Design principles (free-tier optimised):
+      • Flash-first: use high-quota Flash models (1500 RPD) for routine calls.
+      • Pro-reserved: Pro models (25-50 RPD) only for high-GRI / opening / close.
+      • Proactive RPM enforcement: never fire if already at RPM limit for that model.
+      • RPD tracking: count daily calls per model; warn when nearing limit.
+      • Differentiated cooldown: RPM hit → 65s; RPD exhausted → 24h.
+      • RiskManagerAgent gated: only fire the second LLM call when Pro quota is available.
+
+    Pool order = Flash models first (normal use), Pro models last (reserved).
 
     Call-frequency tiers (returned by `recommended_interval_s`):
-      EXTREME GRI  → 120 s   (max responsiveness, opens all models)
-      HIGH GRI     → 180 s
-      ELEVATED     → 300 s   (default)
-      MODERATE     → 420 s
+      Opening      → 180 s   (09:15–09:45)
+      Pre-close    → 180 s   (15:00–15:30)
+      EXTREME GRI  → 180 s
+      HIGH GRI     → 240 s
+      ELEVATED     → 360 s   (default — 62 Flash calls/day)
+      MODERATE     → 480 s
       LOW + calm   → 600 s   (conserve budget)
-      Opening      → 120 s   (09:15–09:45, always)
-      Pre-close    → 150 s   (15:00–15:30, always)
     """
 
-    # Models in priority order (best quality first).
-    # API names verified against Google AI Studio free-tier model list.
+    # Pool in selection priority order.
+    # Flash models first — they have 1500 RPD on free tier.
+    # Pro models last  — they have only 25-50 RPD; reserved for high-risk moments.
     _POOL: List[_ModelSlot] = [
-        _ModelSlot("gemini-1.5-pro",             "1.5 Pro",         5,  2),
-        _ModelSlot("gemini-2.5-pro",             "2.5 Pro",         5,  2),
-        _ModelSlot("gemini-2.5-flash",           "2.5 Flash",       4,  5),
-        _ModelSlot("gemini-2.0-flash",           "2.0 Flash",       4, 10),
-        _ModelSlot("gemini-1.5-flash",           "1.5 Flash",       3, 15),
+        _ModelSlot("gemini-2.5-flash", "2.5 Flash", quality=4, rpm_limit=10, rpd_limit=500,  tier="flash"),
+        _ModelSlot("gemini-2.0-flash", "2.0 Flash", quality=4, rpm_limit=15, rpd_limit=1500, tier="flash"),
+        _ModelSlot("gemini-1.5-flash", "1.5 Flash", quality=3, rpm_limit=15, rpd_limit=1500, tier="flash"),
+        _ModelSlot("gemini-2.5-pro",   "2.5 Pro",   quality=5, rpm_limit=5,  rpd_limit=25,   tier="pro"),
+        _ModelSlot("gemini-1.5-pro",   "1.5 Pro",   quality=5, rpm_limit=2,  rpd_limit=50,   tier="pro"),
     ]
 
-    # Seconds to cool down after a 429 (doubles each consecutive error)
-    _BASE_COOLDOWN_S = 300  # Increase base cooldown to 5 min
+    # Cooldowns: separate RPM vs RPD exhaustion
+    _RPM_COOLDOWN_S  = 65     # just over 1 minute — enough for RPM window to reset
+    _RPD_COOLDOWN_S  = 86400  # 24 hours — daily quota exhausted
+
+    # Warn when a model has used this fraction of its daily quota
+    _RPD_WARN_FRACTION = 0.80
 
     def __init__(self) -> None:
-        # Deep-copy slots so instance state is independent
         import copy
         self._slots: List[_ModelSlot] = copy.deepcopy(self._POOL)
-        self._call_log: List[float] = []   # epoch timestamps of all calls
         logger.info(
-            "ModelRotator initialised with %d models: %s",
-            len(self._slots),
-            [s.display for s in self._slots],
+            "ModelRotator initialised — Flash pool: %s | Pro pool: %s",
+            [s.display for s in self._slots if s.tier == "flash"],
+            [s.display for s in self._slots if s.tier == "pro"],
         )
 
-    # ── Slot selection ────────────────────────────────────────────────────
+    # ── RPD date reset ────────────────────────────────────────────────────
+
+    def _reset_rpd_if_new_day(self, slot: _ModelSlot) -> None:
+        today = datetime.now(_IST).strftime("%Y-%m-%d")
+        if slot.rpd_date != today:
+            slot.rpd_today = 0
+            slot.rpd_date  = today
+
+    # ── Slot availability ─────────────────────────────────────────────────
 
     def _slot_available(self, slot: _ModelSlot) -> bool:
-        """Return True if slot is not in cooldown and within RPM."""
+        """
+        True if slot is ready to accept a call right now.
+        Checks: cooldown timer, proactive RPM window, RPD daily limit.
+        """
         now = time.time()
+
+        # 1. Cooldown (set after 429 or 404)
         if now < slot.cooldown_until:
             return False
+
+        # 2. Proactive RPM check — reset window if > 60s has passed
+        if now - slot.min_window_start >= 60.0:
+            slot.min_window_start = now
+            slot.calls_this_min   = 0
+        if slot.calls_this_min >= slot.rpm_limit:
+            return False
+
+        # 3. Daily quota check
+        self._reset_rpd_if_new_day(slot)
+        if slot.rpd_today >= slot.rpd_limit:
+            return False
+
         return True
 
     def all_on_cooldown(self) -> bool:
-        """Return True when every model slot is still rate-limited."""
         return not any(self._slot_available(s) for s in self._slots)
 
     def soonest_available_in(self) -> float:
-        """Seconds until the first slot comes off cooldown (0 if one is free)."""
-        now = time.time()
-        waits = [max(0.0, s.cooldown_until - now) for s in self._slots]
-        return min(waits)
+        now   = time.time()
+        waits = []
+        for s in self._slots:
+            if self._slot_available(s):
+                return 0.0
+            # Earliest of cooldown expiry or RPM window reset
+            cd   = max(0.0, s.cooldown_until - now)
+            rpm_reset = max(0.0, 60.0 - (now - s.min_window_start))
+            waits.append(min(cd, rpm_reset) if cd > 0 else rpm_reset)
+        return min(waits) if waits else 0.0
 
-    def pick_model(self, gri_composite: float = 0.3) -> _ModelSlot:
+    def pick_model(self, gri_composite: float = 0.3, allow_pro: bool = False) -> "_ModelSlot | None":
         """
         Pick the best available model for the current context.
-        """
-        now   = time.time()
-        ist   = datetime.fromtimestamp(now, tz=_IST)
-        hour  = ist.hour + ist.minute / 60.0
 
-        is_opening   = 9.25 <= hour <= 9.75    # 09:15 – 09:45
-        is_pre_close = 15.0 <= hour <= 15.5    # 15:00 – 15:30
-        is_high_risk = gri_composite >= 0.50
-        use_best     = is_opening or is_pre_close or is_high_risk
-
-        available = [s for s in self._slots if self._slot_available(s)]
-        if not available:
-            # All slots still on cooldown — do NOT force a doomed API call.
-            soonest = self.soonest_available_in()
-            logger.warning(
-                "All Gemini models on cooldown — skipping call (soonest available in %.0fs).",
-                soonest,
-            )
-            return None  # type: ignore[return-value]
-
-        if use_best or len(available) == 1:
-            chosen = available[0]
-        else:
-            # Use second-tier model to preserve premium quota for high-risk moments
-            chosen = available[min(1, len(available) - 1)]
-
-        return chosen
-
-    def mark_success(self, slot: _ModelSlot) -> None:
-        slot.calls_made   += 1
-        slot.last_call_ts  = time.time()
-        slot.errors_429    = 0
-        self._call_log.append(time.time())
-        logger.debug("ModelRotator ✓ %s  (total calls: %d)", slot.display, slot.calls_made)
-
-    def mark_rate_limited(self, slot: _ModelSlot, is_permanent: bool = False) -> None:
-        """Back off exponentially on 429 or limit:0."""
-        slot.errors_429 += 1
-        if is_permanent:
-            cooldown = 86400 # 24h
-        else:
-            cooldown = self._BASE_COOLDOWN_S * (2 ** min(slot.errors_429 - 1, 4))
-        slot.cooldown_until = time.time() + cooldown
-        logger.warning(
-            "ModelRotator 429/Limit on %s — cooldown %.0fs  (error #%d)",
-            slot.display, cooldown, slot.errors_429,
-        )
-
-    def mark_not_found(self, slot: _ModelSlot) -> None:
-        """Permanently disable a slot (404 / model not available in this project)."""
-        slot.cooldown_until = time.time() + 86400  # 24h effectively disabled
-        logger.error(
-            "ModelRotator: %s returned 404 — disabling for today.", slot.display
-        )
-
-    # ── Interval recommendation ───────────────────────────────────────────
-
-    def recommended_interval_s(
-        self,
-        gri_composite: float = 0.3,
-        vix:           float = 18.0,
-    ) -> int:
-        """
-        Return the recommended sleep interval between sentiment calls.
-
-        Balances responsiveness vs API budget conservation.
-        NSE trading day = 375 minutes. At 300s base → 75 calls/day.
+        Strategy:
+          - Normal conditions → Flash models only (preserve Pro quota).
+          - High GRI / opening / close AND allow_pro=True → try Pro first.
+          - If preferred tier unavailable → fall back to any available slot.
         """
         now  = time.time()
         ist  = datetime.fromtimestamp(now, tz=_IST)
         hour = ist.hour + ist.minute / 60.0
 
-        # Market window priority overrides
-        if 9.25 <= hour <= 9.75:    return 120   # Opening 30 min
-        if 15.0 <= hour <= 15.5:    return 120   # Pre-close 30 min
+        is_opening   = 9.25 <= hour <= 9.75
+        is_pre_close = 15.0 <= hour <= 15.5
+        is_high_risk = gri_composite >= 0.55
 
-        # GRI-based
-        if gri_composite >= 0.65:   return 120   # EXTREME
-        if gri_composite >= 0.50:   return 180   # HIGH
-        if gri_composite >= 0.30:   return 300   # ELEVATED (default)
-        if gri_composite >= 0.15:   return 420   # MODERATE
-        return 600                               # LOW — conserve budget
+        use_pro = allow_pro and (is_opening or is_pre_close or is_high_risk)
+
+        # Build candidate list
+        available_flash = [s for s in self._slots if s.tier == "flash" and self._slot_available(s)]
+        available_pro   = [s for s in self._slots if s.tier == "pro"   and self._slot_available(s)]
+        available_all   = [s for s in self._slots if self._slot_available(s)]
+
+        if use_pro and available_pro:
+            chosen = available_pro[0]   # best available Pro
+        elif available_flash:
+            chosen = available_flash[0] # best available Flash (default)
+        elif available_all:
+            chosen = available_all[0]   # last resort — any available
+        else:
+            soonest = self.soonest_available_in()
+            logger.warning(
+                "All Gemini models unavailable — skipping call (soonest in %.0fs).",
+                soonest,
+            )
+            return None
+
+        # Warn if nearing daily limit
+        self._reset_rpd_if_new_day(chosen)
+        rpd_used_frac = chosen.rpd_today / chosen.rpd_limit if chosen.rpd_limit else 0
+        if rpd_used_frac >= self._RPD_WARN_FRACTION:
+            logger.warning(
+                "⚠️  %s daily quota at %.0f%% (%d/%d calls).",
+                chosen.display, rpd_used_frac * 100, chosen.rpd_today, chosen.rpd_limit,
+            )
+
+        return chosen
+
+    def mark_success(self, slot: _ModelSlot) -> None:
+        now = time.time()
+        slot.calls_made      += 1
+        slot.last_call_ts     = now
+        slot.errors_429       = 0
+        slot.calls_this_min  += 1
+        self._reset_rpd_if_new_day(slot)
+        slot.rpd_today       += 1
+        logger.debug(
+            "ModelRotator ✓ %s  (RPM window: %d/%d | RPD: %d/%d)",
+            slot.display, slot.calls_this_min, slot.rpm_limit,
+            slot.rpd_today, slot.rpd_limit,
+        )
+
+    def mark_rate_limited(self, slot: _ModelSlot, is_daily: bool = False) -> None:
+        """
+        Apply cooldown after a 429.
+        is_daily=True → quota exhausted for today (24h cooldown).
+        is_daily=False → RPM hit (65s cooldown — just past the 1-min window).
+        """
+        slot.errors_429 += 1
+        if is_daily:
+            cooldown = self._RPD_COOLDOWN_S
+            logger.warning(
+                "ModelRotator: %s daily quota exhausted — disabling for 24h.", slot.display
+            )
+        else:
+            # Exponential back-off capped at 10 min for RPM errors
+            cooldown = min(self._RPM_COOLDOWN_S * (2 ** min(slot.errors_429 - 1, 3)), 600)
+            logger.warning(
+                "ModelRotator: %s RPM limit hit — cooldown %.0fs (error #%d).",
+                slot.display, cooldown, slot.errors_429,
+            )
+        slot.cooldown_until = time.time() + cooldown
+
+    def mark_not_found(self, slot: _ModelSlot) -> None:
+        slot.cooldown_until = time.time() + self._RPD_COOLDOWN_S
+        logger.error("ModelRotator: %s returned 404 — disabling for today.", slot.display)
+
+    # ── Interval recommendation ───────────────────────────────────────────
+
+    def recommended_interval_s(self, gri_composite: float = 0.3, vix: float = 18.0) -> int:
+        """
+        Recommended sleep between sentiment cycles.
+        NSE day = 375 min. At 360s base → ~62 Flash calls/day — well within 1500 RPD.
+        Pro models are called at most ~10x/day (only during high-risk windows).
+        """
+        now  = time.time()
+        ist  = datetime.fromtimestamp(now, tz=_IST)
+        hour = ist.hour + ist.minute / 60.0
+
+        if 9.25 <= hour <= 9.75:   return 180   # Opening window
+        if 15.0 <= hour <= 15.5:   return 180   # Pre-close window
+        if gri_composite >= 0.65:  return 180   # EXTREME risk
+        if gri_composite >= 0.50:  return 240   # HIGH risk
+        if gri_composite >= 0.30:  return 360   # ELEVATED (default)
+        if gri_composite >= 0.15:  return 480   # MODERATE
+        return 600                              # LOW — conserve budget
+
+    def can_afford_risk_manager(self) -> bool:
+        """
+        Return True only when a Pro slot has remaining daily quota.
+        Prevents RiskManagerAgent from burning Flash quota on a second call.
+        """
+        return any(
+            s.tier == "pro" and self._slot_available(s)
+            for s in self._slots
+        )
 
     def daily_stats(self) -> Dict[str, Any]:
+        now = time.time()
         return {
             s.display: {
-                "calls": s.calls_made,
-                "errors_429": s.errors_429,
-                "available": self._slot_available(s),
+                "calls_total": s.calls_made,
+                "rpd_today":   s.rpd_today,
+                "rpd_limit":   s.rpd_limit,
+                "rpm_window":  s.calls_this_min,
+                "rpm_limit":   s.rpm_limit,
+                "errors_429":  s.errors_429,
+                "available":   self._slot_available(s),
+                "cooldown_s":  max(0.0, round(s.cooldown_until - now)),
+                "tier":        s.tier,
             }
             for s in self._slots
         }
@@ -405,16 +486,21 @@ async def _call_gemini_with_rotation(
     generation_config: Any,
     history: Optional[List[Dict]] = None,
     response_mime_type: str = "text/plain",
+    allow_pro: bool = False,
 ) -> tuple:
     """
     Calls Gemini with automatic model rotation on 429 / 404 errors.
     Returns (response_text, model_display_name).
+
+    allow_pro=True: passed for RiskManagerAgent calls so the rotator may
+    select a Pro-tier model when quota allows (Pro reserved for high-risk
+    contextualisation; Flash used for all routine sentiment calls).
     """
     slots_tried = 0
     last_exc = None
 
     while slots_tried < len(_rotator._slots):
-        slot = _rotator.pick_model(gri_composite)
+        slot = _rotator.pick_model(gri_composite, allow_pro=allow_pro)
         if slot is None:
             # All models on cooldown — raise immediately so callers use fallback
             raise RuntimeError("All Gemini models on cooldown — quota exhausted.")
@@ -449,14 +535,18 @@ async def _call_gemini_with_rotation(
         except Exception as exc:
             last_exc = exc
             err_msg  = str(exc)
-            
+
             # Quota/Rate Limit handling
             if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-                # Check for "limit: 0" which means permanent lack of quota for this model
-                is_perm = "limit: 0" in err_msg or "limit: 0.0" in err_msg
-                _rotator.mark_rate_limited(slot, is_permanent=is_perm)
-                logger.warning("⟳ Model %s rate-limited%s — rotating.", 
-                               slot.display, " (PERMANENT)" if is_perm else "")
+                # Distinguish daily (RPD) exhaustion from per-minute (RPM) rate limit.
+                # "limit: 0" / "quota" / "daily" in the error text → daily quota gone.
+                is_daily = (
+                    "limit: 0" in err_msg or "limit: 0.0" in err_msg
+                    or "quota" in err_msg.lower() or "daily" in err_msg.lower()
+                )
+                _rotator.mark_rate_limited(slot, is_daily=is_daily)
+                logger.warning("⟳ Model %s rate-limited%s — rotating.",
+                               slot.display, " (daily quota)" if is_daily else " (RPM)")
                 await asyncio.sleep(2)
                 continue
 
@@ -597,6 +687,7 @@ async def risk_manager_agent(state: AgentState) -> AgentState:
         context, model_used = await _call_gemini_with_rotation(
             prompt=prompt, system=_RISK_SYSTEM,
             gri_composite=gri, generation_config=gen_cfg,
+            allow_pro=True,   # RiskManager may use Pro model if quota allows
         )
         latency_ms = (time.perf_counter() - t0) * 1000
         logger.info("RiskManagerAgent [%s]: completed in %.0f ms", model_used, latency_ms)
@@ -632,9 +723,17 @@ def _route_after_sentiment(state: AgentState) -> str:
     high_vol        = vol in ("HIGH", "EXTREME") or stress > 22.0
 
     if high_conviction or high_vol:
-        logger.debug("Router → risk_manager (score=%.3f vol=%s vix=%.1f)",
-                     score, vol, stress)
-        return "risk_manager"
+        if _rotator.can_afford_risk_manager():
+            logger.debug(
+                "Router → risk_manager (score=%.3f vol=%s vix=%.1f)",
+                score, vol, stress,
+            )
+            return "risk_manager"
+        logger.info(
+            "Router → assemble: conviction/vol warrants risk_manager but "
+            "no Pro quota remaining — skipping to conserve Flash budget."
+        )
+        return "assemble"
 
     logger.debug("Router → assemble (low conviction / low vol — skipping risk manager)")
     return "assemble"
