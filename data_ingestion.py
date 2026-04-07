@@ -330,7 +330,9 @@ class AsyncKiteTickerWrapper:
         symbol_map: Dict[int, str],
         redis_client: aioredis.Redis,
         rate_limiter: RateLimiter,
+        token_error_callback=None,   # async callable; fired once on WebSocket 403
     ) -> None:
+        self._api_key       = api_key           # stored for ticker recreation on refresh
         self._instruments   = instruments
         self._symbol_map    = symbol_map
         self._rate_limiter  = rate_limiter
@@ -340,6 +342,10 @@ class AsyncKiteTickerWrapper:
 
         self._aflow:    Dict[str, AggressiveFlowSnapshot] = {}
         self._aflow_ts: Dict[str, float] = {}
+
+        # Token-expiry signalling
+        self._token_error_callback   = token_error_callback
+        self._token_expired_notified = False   # prevent callback storm on repeated 403s
 
         self._ticker = KiteTicker(api_key, access_token)
         self._ticker.on_ticks     = self._on_ticks_sync
@@ -366,12 +372,37 @@ class AsyncKiteTickerWrapper:
 
     def _on_error_sync(self, ws: Any, code: int, reason: str) -> None:
         logger.error("KiteTicker error %s: %s", code, reason)
+        # 403 inside the reason string = expired / invalid access token.
+        # Fire the callback exactly once per expiry cycle so the main loop
+        # can pause the bot and prompt the user for a fresh token.
+        if "403" in str(reason) and not self._token_expired_notified:
+            self._token_expired_notified = True
+            logger.critical(
+                "KiteTicker 403 — access token expired. Signalling token-refresh flow."
+            )
+            self._fire_token_error_callback()
 
     def _on_close_sync(self, ws: Any, code: int, reason: str) -> None:
         logger.warning("KiteTicker closed %s: %s", code, reason)
+        if "403" in str(reason) and not self._token_expired_notified:
+            self._token_expired_notified = True
+            logger.critical(
+                "KiteTicker closed with 403 — access token expired. Signalling token-refresh flow."
+            )
+            self._fire_token_error_callback()
+
+    def _fire_token_error_callback(self) -> None:
+        """Thread-safe bridge: schedule the async callback onto the event loop."""
+        if self._token_error_callback and self._loop and not self._loop.is_closed():
+            asyncio.run_coroutine_threadsafe(
+                self._token_error_callback(), self._loop
+            )
 
     def _on_reconnect_sync(self, ws: Any, attempts: int) -> None:
         logger.info("KiteTicker reconnecting (attempt %d)…", attempts)
+        # If token is expired, suppress reconnect log spam after first attempt
+        if self._token_expired_notified and attempts > 1:
+            logger.debug("KiteTicker: token expired — reconnect attempt %d skipped.", attempts)
 
     # Async processor -------------------------------------------------------
 
@@ -411,6 +442,33 @@ class AsyncKiteTickerWrapper:
                                tick.get("instrument_token"), exc)
 
     # Lifecycle -------------------------------------------------------------
+
+    async def reconnect_with_token(self, new_token: str) -> None:
+        """
+        Stop the current WebSocket connection and reconnect with a fresh access
+        token.  Called after the user has supplied a new token via /token.
+        """
+        logger.info("KiteTicker: closing old connection for token refresh…")
+        try:
+            self._ticker.close()
+        except Exception as exc:
+            logger.warning("KiteTicker close (pre-reconnect) error: %s", exc)
+
+        await asyncio.sleep(2)          # let the close propagate
+
+        # Reset the expiry flag so the next expiry will trigger the callback again
+        self._token_expired_notified = False
+
+        # Recreate the ticker with the new token and re-attach all callbacks
+        self._ticker = KiteTicker(self._api_key, new_token)
+        self._ticker.on_ticks     = self._on_ticks_sync
+        self._ticker.on_connect   = self._on_connect_sync
+        self._ticker.on_error     = self._on_error_sync
+        self._ticker.on_close     = self._on_close_sync
+        self._ticker.on_reconnect = self._on_reconnect_sync
+
+        self._ticker.connect(threaded=True)
+        logger.info("KiteTicker: reconnected with fresh access token.")
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()

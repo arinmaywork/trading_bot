@@ -651,7 +651,13 @@ async def strategy_loop(
                     logger.info("Waiting for /token via Telegram…")
                     while not bot_state.token_valid:
                         await asyncio.sleep(10)
-                    logger.info("Token refreshed — resuming strategy loop.")
+                    logger.info("Token refreshed — reconnecting WebSocket and resuming.")
+                    # Reconnect KiteTicker with the new token (kite.access_token
+                    # is updated by TelegramController's /token handler).
+                    try:
+                        await ticker_wrapper.reconnect_with_token(kite.access_token)
+                    except Exception as _tr_exc:
+                        logger.error("Ticker reconnect after REST 403 failed: %s", _tr_exc)
                     bot_state.paused = False
             else:
                 logger.error("LTP batch failed: %s", exc)
@@ -1091,10 +1097,37 @@ async def main(kite: KiteConnect, access_token: str, tg_offset: int = 0) -> None
         for s in active_symbols
         if universe_engine.get_metadata(s) and universe_engine.get_metadata(s).instrument_token > 0
     }
+    # ── WebSocket token-expiry callback ──────────────────────────────────────
+    # Called from the KiteTicker thread when a 403 is received.
+    # Sets the bot to paused state and sends a Telegram alert so the user
+    # can supply a fresh token via /token without restarting the service.
+    async def _on_ticker_token_error() -> None:
+        if not bot_state.token_valid:
+            return   # already being handled (e.g. REST also caught it)
+        logger.critical("WebSocket 403 — access token expired. Pausing bot and requesting refresh.")
+        bot_state.token_valid = False
+        bot_state.paused      = True
+        try:
+            login_url = kite.login_url()
+            await telegram.send(
+                "🔴 <b>Zerodha Token Expired (WebSocket 403)</b>\n"
+                f"{'─' * 34}\n"
+                "The daily access token has expired. Trading is paused.\n\n"
+                "<b>To refresh without restarting:</b>\n"
+                f"1️⃣ Open: <code>{login_url}</code>\n"
+                "2️⃣ Complete Zerodha login\n"
+                "3️⃣ Copy the <code>request_token</code> from the redirect URL\n"
+                "4️⃣ Send: <code>/token &lt;request_token&gt;</code>\n\n"
+                "Trading and WebSocket feed resume automatically after /token."
+            )
+        except Exception as _cb_exc:
+            logger.error("Could not send token-expired Telegram alert: %s", _cb_exc)
+
     ticker_wrapper = AsyncKiteTickerWrapper(
         api_key=settings.kite.API_KEY, access_token=access_token,
         instruments=active_tokens[:settings.universe.MAX_WEBSOCKET_SUBSCRIPTIONS],
         symbol_map=symbol_map, redis_client=redis_client, rate_limiter=rate_limiter,
+        token_error_callback=_on_ticker_token_error,
     )
     ws_manager = WebSocketSubscriptionManager(ticker_wrapper, rate_limiter)
     universe_engine.register_change_callback(ws_manager.on_universe_change)
@@ -1201,6 +1234,29 @@ async def main(kite: KiteConnect, access_token: str, tg_offset: int = 0) -> None
                     _shb["errors"] += 1
             await asyncio.sleep(interval)
 
+    # ── Token watch loop ────────────────────────────────────────────────────
+    # Handles the case where the WebSocket 403 fires (via _on_ticker_token_error)
+    # but the REST API still works, so the strategy_loop exception handler never
+    # sees a 403.  This loop detects the token_valid=False signal, waits for the
+    # user to send /token, then reconnects the ticker and resumes the bot.
+    async def _token_watch_loop() -> None:
+        while True:
+            await asyncio.sleep(5)
+            if bot_state.token_valid:
+                continue
+            # Token became invalid — wait for refresh
+            logger.info("TokenWatcher: token invalid, waiting for /token via Telegram…")
+            while not bot_state.token_valid:
+                await asyncio.sleep(5)
+            # Token is fresh — reconnect WebSocket
+            logger.info("TokenWatcher: token refreshed — reconnecting WebSocket ticker.")
+            try:
+                await ticker_wrapper.reconnect_with_token(kite.access_token)
+            except Exception as _tw_exc:
+                logger.error("TokenWatcher: ticker reconnect failed: %s", _tw_exc)
+            bot_state.paused = False
+            logger.info("TokenWatcher: bot resumed after token refresh.")
+
     candle_task    = asyncio.create_task(candle_agg.run(), name="candle_agg")
     alt_tasks      = await alt_data.start_background_tasks()
     geo_tasks      = await geo_monitor.start_background_tasks()
@@ -1217,14 +1273,16 @@ async def main(kite: KiteConnect, access_token: str, tg_offset: int = 0) -> None
             logbook=logbook, bot_state=bot_state,
         ), name="strategy_loop",
     )
-    sentiment_task = asyncio.create_task(sentiment_loop(), name="sentiment_loop")
-    ml_retrain_task = asyncio.create_task(
+    sentiment_task    = asyncio.create_task(sentiment_loop(), name="sentiment_loop")
+    token_watch_task  = asyncio.create_task(_token_watch_loop(), name="token_watcher")
+    ml_retrain_task   = asyncio.create_task(
         ml_engine.run_retrain_loop(active_symbols), name="ml_retrain"
     )
     logbook_task   = asyncio.create_task(logbook.run_summary_loop(), name="logbook")
     tg_status_task = asyncio.create_task(tg_controller.status_broadcast_loop(), name="tg_status")
 
-    all_tasks = [candle_task, strat_task, sentiment_task, ml_retrain_task, logbook_task, tg_status_task] \
+    all_tasks = [candle_task, strat_task, sentiment_task, token_watch_task,
+                 ml_retrain_task, logbook_task, tg_status_task] \
                 + alt_tasks + geo_tasks + universe_tasks
 
     for t in all_tasks:
