@@ -10,3 +10,4 @@ logs/
 .DS_Store
 *.sh.env
 .env.sh
+.gemini_quota.json

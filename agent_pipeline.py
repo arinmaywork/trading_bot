@@ -46,6 +46,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, TypedDict
 
 from google import genai
@@ -144,14 +145,76 @@ class ModelRotator:
     # Warn when a model has used this fraction of its daily quota
     _RPD_WARN_FRACTION = 0.80
 
+    # Path for persisting daily quota counters across process restarts.
+    # Dot-file keeps it out of the way; excluded from git via .gitignore.
+    _QUOTA_STATE_FILE: Path = Path(__file__).parent / ".gemini_quota.json"
+
     def __init__(self) -> None:
         import copy
         self._slots: List[_ModelSlot] = copy.deepcopy(self._POOL)
+        self._load_quota_state()          # restore RPD counters & active cooldowns
         logger.info(
             "ModelRotator initialised — Flash pool: %s | Pro pool: %s",
             [s.display for s in self._slots if s.tier == "flash"],
             [s.display for s in self._slots if s.tier == "pro"],
         )
+
+    # ── Quota state persistence ───────────────────────────────────────────
+
+    def _save_quota_state(self) -> None:
+        """
+        Persist per-model RPD counters and active cooldown timestamps to disk.
+        Called after every mark_success / mark_rate_limited / mark_not_found so
+        that process restarts don't reset the daily call count and re-exhaust
+        the same quota that was already consumed in this IST day.
+        """
+        now = time.time()
+        state: Dict[str, Any] = {}
+        for s in self._slots:
+            state[s.api_name] = {
+                "rpd_today":     s.rpd_today,
+                "rpd_date":      s.rpd_date,
+                # Only persist cooldowns that are still active (> 60 s remaining)
+                # so short RPM cooldowns are not needlessly carried over restarts.
+                "cooldown_until": s.cooldown_until if s.cooldown_until - now > 60 else 0.0,
+            }
+        try:
+            self._QUOTA_STATE_FILE.write_text(json.dumps(state, indent=2))
+        except Exception as exc:
+            logger.warning("Could not save Gemini quota state: %s", exc)
+
+    def _load_quota_state(self) -> None:
+        """
+        Restore RPD counters saved by _save_quota_state.
+        Only restores data whose rpd_date matches today (IST) so yesterday's
+        counts don't carry over after the Google quota reset (midnight IST).
+        """
+        if not self._QUOTA_STATE_FILE.exists():
+            return
+        try:
+            data  = json.loads(self._QUOTA_STATE_FILE.read_text())
+            today = datetime.now(_IST).strftime("%Y-%m-%d")
+            now   = time.time()
+            for s in self._slots:
+                saved = data.get(s.api_name, {})
+                if saved.get("rpd_date") == today:
+                    s.rpd_today = int(saved.get("rpd_today", 0))
+                    s.rpd_date  = today
+                    # Restore still-active cooldowns (e.g. 24-h RPD block)
+                    saved_cd = float(saved.get("cooldown_until", 0.0))
+                    if saved_cd > now:
+                        s.cooldown_until = saved_cd
+                        logger.info(
+                            "Restored %s: RPD %d/%d  cooldown %.0f s remaining.",
+                            s.display, s.rpd_today, s.rpd_limit, saved_cd - now,
+                        )
+                    else:
+                        logger.info(
+                            "Restored %s: RPD %d/%d (no active cooldown).",
+                            s.display, s.rpd_today, s.rpd_limit,
+                        )
+        except Exception as exc:
+            logger.warning("Could not load Gemini quota state: %s", exc)
 
     # ── RPD date reset ────────────────────────────────────────────────────
 
@@ -161,29 +224,43 @@ class ModelRotator:
             slot.rpd_today = 0
             slot.rpd_date  = today
 
+    # ── RPM window management (separated from availability check) ─────────
+
+    def _advance_rpm_window(self, slot: _ModelSlot) -> None:
+        """
+        Advance the slot's 60-second RPM window if it has expired.
+        MUST be called ONLY when we are about to make a call (in pick_model)
+        — NOT inside _slot_available — so that merely checking availability
+        doesn't corrupt the window counter.
+        """
+        now = time.time()
+        if now - slot.min_window_start >= 60.0:
+            slot.min_window_start = now
+            slot.calls_this_min   = 0
+
     # ── Slot availability ─────────────────────────────────────────────────
 
     def _slot_available(self, slot: _ModelSlot) -> bool:
         """
-        True if slot is ready to accept a call right now.
-        Checks: cooldown timer, proactive RPM window, RPD daily limit.
+        Pure read — returns True if slot can accept a call right now.
+        Does NOT mutate any state (window reset is in _advance_rpm_window).
         """
         now = time.time()
 
-        # 1. Cooldown (set after 429 or 404)
+        # 1. Cooldown block (set after 429 or 404)
         if now < slot.cooldown_until:
             return False
 
-        # 2. Proactive RPM check — reset window if > 60s has passed
-        if now - slot.min_window_start >= 60.0:
-            slot.min_window_start = now
-            slot.calls_this_min   = 0
-        if slot.calls_this_min >= slot.rpm_limit:
+        # 2. Proactive RPM check — read the window WITHOUT resetting it
+        elapsed = now - slot.min_window_start
+        effective_calls = slot.calls_this_min if elapsed < 60.0 else 0
+        if effective_calls >= slot.rpm_limit:
             return False
 
         # 3. Daily quota check
-        self._reset_rpd_if_new_day(slot)
-        if slot.rpd_today >= slot.rpd_limit:
+        today = datetime.now(_IST).strftime("%Y-%m-%d")
+        effective_rpd = slot.rpd_today if slot.rpd_date == today else 0
+        if effective_rpd >= slot.rpd_limit:
             return False
 
         return True
@@ -241,8 +318,12 @@ class ModelRotator:
             )
             return None
 
-        # Warn if nearing daily limit
+        # Advance the RPM window ONLY here (just before a real call is issued),
+        # not inside _slot_available, so availability checks don't corrupt the counter.
+        self._advance_rpm_window(chosen)
         self._reset_rpd_if_new_day(chosen)
+
+        # Warn if nearing daily limit
         rpd_used_frac = chosen.rpd_today / chosen.rpd_limit if chosen.rpd_limit else 0
         if rpd_used_frac >= self._RPD_WARN_FRACTION:
             logger.warning(
@@ -265,12 +346,13 @@ class ModelRotator:
             slot.display, slot.calls_this_min, slot.rpm_limit,
             slot.rpd_today, slot.rpd_limit,
         )
+        self._save_quota_state()   # persist so restarts see today's count
 
     def mark_rate_limited(self, slot: _ModelSlot, is_daily: bool = False) -> None:
         """
         Apply cooldown after a 429.
-        is_daily=True → quota exhausted for today (24h cooldown).
-        is_daily=False → RPM hit (65s cooldown — just past the 1-min window).
+        is_daily=True  → daily quota exhausted (24h cooldown).
+        is_daily=False → RPM hit (65s + exponential back-off).
         """
         slot.errors_429 += 1
         if is_daily:
@@ -286,10 +368,12 @@ class ModelRotator:
                 slot.display, cooldown, slot.errors_429,
             )
         slot.cooldown_until = time.time() + cooldown
+        self._save_quota_state()   # persist cooldowns (especially 24-h blocks)
 
     def mark_not_found(self, slot: _ModelSlot) -> None:
         slot.cooldown_until = time.time() + self._RPD_COOLDOWN_S
         logger.error("ModelRotator: %s returned 404 — disabling for today.", slot.display)
+        self._save_quota_state()
 
     # ── Interval recommendation ───────────────────────────────────────────
 
@@ -539,15 +623,26 @@ async def _call_gemini_with_rotation(
             # Quota/Rate Limit handling
             if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
                 # Distinguish daily (RPD) exhaustion from per-minute (RPM) rate limit.
-                # "limit: 0" / "quota" / "daily" in the error text → daily quota gone.
+                #
+                # Google's error messages use these distinguishing phrases:
+                #   RPM → "generate_requests_per_minute" (contains "per_minute")
+                #   RPD → "generate_requests_per_day"    (contains "per_day")
+                #
+                # IMPORTANT: do NOT use "quota" alone — both RPM and RPD errors
+                # contain "quota" and "RESOURCE_EXHAUSTED".  Treating RPM errors
+                # as daily would put Flash models on 24-h cooldown from a simple
+                # per-minute rate limit, permanently eliminating them.
+                err_lower = err_msg.lower()
                 is_daily = (
-                    "limit: 0" in err_msg or "limit: 0.0" in err_msg
-                    or "quota" in err_msg.lower() or "daily" in err_msg.lower()
+                    "per_day"  in err_lower     # Google standard RPD phrase
+                    or "daily" in err_lower     # generic / older SDK phrasing
+                    or "limit: 0" in err_msg    # free-tier model has zero quota
+                    or "limit: 0.0" in err_msg
                 )
                 _rotator.mark_rate_limited(slot, is_daily=is_daily)
                 logger.warning("⟳ Model %s rate-limited%s — rotating.",
-                               slot.display, " (daily quota)" if is_daily else " (RPM)")
-                await asyncio.sleep(2)
+                               slot.display, " (daily quota → 24h)" if is_daily else " (RPM → 65s)")
+                await asyncio.sleep(5)   # 5s between model rotations (was 2s)
                 continue
 
             # Not Found handling
@@ -556,10 +651,10 @@ async def _call_gemini_with_rotation(
                 logger.warning("⟳ Model %s not found — disabling.", slot.display)
                 continue
 
-            # Other errors
+            # Other errors — treat as temporary RPM-style cooldown (is_daily=False)
             logger.warning("⟳ Model %s error: %s — trying next.", slot.display, exc)
-            _rotator.mark_rate_limited(slot) # treat as temporary
-            await asyncio.sleep(2)
+            _rotator.mark_rate_limited(slot, is_daily=False)
+            await asyncio.sleep(5)
             continue
 
     raise RuntimeError(f"All Gemini models exhausted. Last error: {last_exc}")
