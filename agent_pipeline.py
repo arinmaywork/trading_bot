@@ -269,15 +269,31 @@ class ModelRotator:
         return not any(self._slot_available(s) for s in self._slots)
 
     def soonest_available_in(self) -> float:
+        """
+        Seconds until the first model becomes available.
+
+        Binding constraints:
+          • Active cooldown (429/404) → must wait for cooldown_until
+          • No cooldown but RPM window full → wait for window to reset
+
+        BUG that was here: used min(cooldown, rpm_reset).  For a model
+        on 24h cooldown this returned ~30s (rpm_reset), making the
+        sentiment loop wake up every 60s for 24 hours instead of waiting
+        the full cooldown duration.
+        """
         now   = time.time()
         waits = []
         for s in self._slots:
             if self._slot_available(s):
                 return 0.0
-            # Earliest of cooldown expiry or RPM window reset
-            cd   = max(0.0, s.cooldown_until - now)
-            rpm_reset = max(0.0, 60.0 - (now - s.min_window_start))
-            waits.append(min(cd, rpm_reset) if cd > 0 else rpm_reset)
+            cd = max(0.0, s.cooldown_until - now)
+            if cd > 0:
+                # Hard cooldown is the binding constraint — RPM window is irrelevant.
+                waits.append(cd)
+            else:
+                # No cooldown; only obstacle is the RPM window being full.
+                rpm_reset = max(0.0, 60.0 - (now - s.min_window_start))
+                waits.append(rpm_reset)
         return min(waits) if waits else 0.0
 
     def pick_model(self, gri_composite: float = 0.3, allow_pro: bool = False) -> "_ModelSlot | None":
@@ -624,25 +640,35 @@ async def _call_gemini_with_rotation(
             if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
                 # Distinguish daily (RPD) exhaustion from per-minute (RPM) rate limit.
                 #
-                # Google's error messages use these distinguishing phrases:
-                #   RPM → "generate_requests_per_minute" (contains "per_minute")
-                #   RPD → "generate_requests_per_day"    (contains "per_day")
+                # Google's standard phrases:
+                #   RPM → "generate_requests_per_minute"  (contains "per_minute")
+                #   RPD → "generate_requests_per_day"     (contains "per_day")
                 #
-                # IMPORTANT: do NOT use "quota" alone — both RPM and RPD errors
-                # contain "quota" and "RESOURCE_EXHAUSTED".  Treating RPM errors
-                # as daily would put Flash models on 24-h cooldown from a simple
-                # per-minute rate limit, permanently eliminating them.
+                # DO NOT use "quota" alone — both RPM and RPD errors contain it.
+                # Treating RPM hits as daily would give Flash models a 24h ban
+                # from a simple per-minute rate limit, permanently disabling them.
+                #
+                # Fallback heuristics for short-form error messages that only say
+                # "RESOURCE_EXHAUSTED" without the quota-metric detail:
+                #   1. calls_made == 0 → we just started; can't have hit RPM yet
+                #      (RPM requires prior successful calls to fill the window)
+                #      → must be daily exhaustion from a previous run.
+                #   2. errors_429 >= 3 → three consecutive 429s even after RPM
+                #      cooldowns → window keeps exhausting → treat as daily.
                 err_lower = err_msg.lower()
                 is_daily = (
-                    "per_day"  in err_lower     # Google standard RPD phrase
-                    or "daily" in err_lower     # generic / older SDK phrasing
-                    or "limit: 0" in err_msg    # free-tier model has zero quota
+                    "per_day"       in err_lower    # Google standard RPD phrase
+                    or "daily"      in err_lower    # generic / older SDK phrasing
+                    or "limit: 0"   in err_msg      # free-tier: zero quota allocated
                     or "limit: 0.0" in err_msg
+                    # Heuristics for opaque "RESOURCE_EXHAUSTED" messages:
+                    or slot.calls_made == 0         # no successes → can't be RPM
+                    or slot.errors_429 >= 3         # repeated 429s → escalate
                 )
                 _rotator.mark_rate_limited(slot, is_daily=is_daily)
                 logger.warning("⟳ Model %s rate-limited%s — rotating.",
-                               slot.display, " (daily quota → 24h)" if is_daily else " (RPM → 65s)")
-                await asyncio.sleep(5)   # 5s between model rotations (was 2s)
+                               slot.display, " (daily → 24h)" if is_daily else " (RPM → 65s)")
+                await asyncio.sleep(5)
                 continue
 
             # Not Found handling
