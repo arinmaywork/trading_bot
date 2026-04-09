@@ -459,9 +459,10 @@ class RiskManager:
                     )
                     final = min_qty
                 else:
-                    logger.info(
-                        "CostFilter %s: skipping — exp_pnl=₹%.2f < 2x cost=₹%.2f "
-                        "(brokerage+STT hurdle not cleared even at min_trade_value=₹%.0f)",
+                    logger.warning(                              # Bug #13: elevated INFO→WARNING
+                        "CostFilter %s: SKIPPING TRADE — exp_pnl=₹%.2f < 2x cost=₹%.2f "
+                        "(brokerage+STT hurdle not cleared even at min_trade_value=₹%.0f). "
+                        "Tip: increase capital or wait for a stronger signal.",
                         symbol, exp_pl, cost, cfg_costs.MIN_TRADE_VALUE,
                     )
                     return 0, f_final, f_busseti, False, (
@@ -620,9 +621,17 @@ class StrategyEngine:
             (ml_signal > 0 and current_price > vwap) or
             (ml_signal < 0 and current_price < vwap)
         )
+        # Bug #14 fix: RSI extremum blocks momentum continuation only when ML
+        # confidence is LOW (<0.60).  High-confidence models (≥0.60) have already
+        # priced in overbought/oversold exhaustion — hard-vetoing them misses the
+        # strongest breakout moves.  At low confidence we still protect against
+        # blindly chasing an extended tape.
+        _rsi_veto_threshold = 0.60
+        _high_confidence    = signal_out.confidence >= _rsi_veto_threshold
         rsi_neutral = (
-            (ml_signal > 0 and rsi < 70) or
-            (ml_signal < 0 and rsi > 30)
+            _high_confidence                                # high-conf: never veto
+            or (ml_signal > 0 and rsi < 70)                # buying below overbought
+            or (ml_signal < 0 and rsi > 30)                # selling above oversold
         )
 
         if is_decayed or abs(ml_signal) < settings.strategy.MIN_ALPHA_THRESHOLD:
@@ -635,7 +644,10 @@ class StrategyEngine:
         elif not rsi_neutral:
             direction = TradeDirection.FLAT
             qty       = 0
-            size_reason += f" | FLAT: RSI extremum ({rsi:.1f})"
+            size_reason += (
+                f" | FLAT: RSI extremum ({rsi:.1f}) — low-conf "
+                f"({signal_out.confidence:.2f}<{_rsi_veto_threshold})"
+            )
         elif ml_signal > 0:
             direction = TradeDirection.BUY
         else:

@@ -719,14 +719,37 @@ class GeopoliticalRiskMonitor:
                 await asyncio.sleep(backoff)
 
     async def initialise(self) -> None:
-        """On startup: try Redis cache, then do an immediate live fetch."""
+        """On startup: try Redis cache, then do an immediate live fetch.
+
+        FIX B-18 (Bug #3): Previously a fetch failure left self._current at
+        GeopoliticalRiskIndex.neutral() which has composite=0.0, india_vix=0.0,
+        usdinr=0.0, level='UNKNOWN'. These zeros propagated silently through the
+        strategy loop — position sizing assumed 0% geo risk (kelly_mult=1.0),
+        vol regime was always 'LOW', and the Telegram status showed GRI=0.000
+        with no alert. The background fetch_loop was still running but its first
+        retry wouldn't happen for FETCH_INTERVAL_SECONDS (5 min), so the bot
+        traded on phantom data for the first 5 minutes.
+
+        Now: on initial fetch failure, log at ERROR level (not WARNING), schedule
+        an immediate retry via the background loop, and mark the startup GRI as
+        'stale' so the strategy loop can detect and suppress trading until fresh
+        data arrives.
+        """
         loaded = await self.load_from_redis()
         if not loaded:
             logger.info("GRI: No cache — fetching live data now…")
             try:
                 await self.fetch_now()
             except Exception as exc:
-                logger.warning("GRI initial fetch failed: %s — using neutral default.", exc)
+                logger.error(
+                    "GRI initial fetch failed: %s\n"
+                    "Bot will use neutral default (composite=0.10) until the "
+                    "background fetch_loop succeeds. GRI data may be stale for "
+                    "up to %d seconds.",
+                    exc, self.FETCH_INTERVAL_SECONDS,
+                )
+                # The _fetch_loop will retry; mark last_fetch=0 to force immediate retry
+                self._last_fetch = 0.0
 
     async def start_background_tasks(self) -> list:
         tasks = [

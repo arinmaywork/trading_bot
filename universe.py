@@ -1050,12 +1050,38 @@ class UniverseEngine:
         Called once at bot startup:
           1. Try to load today's universe from Redis cache.
           2. If not available, run a full daily refresh immediately.
+
+        FIX B-18 (Bug #1): Previously, if run_daily_refresh() raised an exception,
+        it propagated silently — the bot continued startup with _active_symbols=[]
+        and the strategy loop would loop forever with "Empty universe — waiting for
+        initialisation" every 5 seconds, never trading, with no visible error.
+
+        Now: log the full traceback at CRITICAL level, then fall back to the static
+        watchlist so the bot can trade at least a handful of liquid stocks while the
+        dynamic universe is unavailable. A Telegram alert will surface the failure.
         """
         logger.info("UniverseEngine: initialising…")
         loaded = await self._load_from_redis()
         if not loaded:
             logger.info("No cached universe — running full refresh now (this may take several minutes)…")
-            await self.run_daily_refresh()
+            try:
+                await self.run_daily_refresh()
+            except Exception as exc:
+                logger.critical(
+                    "UniverseEngine.initialise FAILED: %s\n"
+                    "Falling back to static watchlist (%d symbols). "
+                    "Universe will retry at next scheduled refresh (08:45 IST).",
+                    exc, len(self._strat_cfg.STATIC_WATCHLIST),
+                    exc_info=True,
+                )
+                # Fall back to static watchlist so strategy loop is not permanently stuck
+                fallback = list(self._strat_cfg.STATIC_WATCHLIST)
+                if not self._active_symbols and fallback:
+                    self._active_symbols = fallback
+                    logger.warning(
+                        "Fallback universe set to static watchlist: %s",
+                        self._active_symbols,
+                    )
         else:
             logger.info("Using cached universe: %d symbols.", len(self._active_symbols))
 

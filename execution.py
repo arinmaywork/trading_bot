@@ -604,13 +604,25 @@ class OrderExecutor:
             # ---- Paper trade mode: simulate fill without hitting Zerodha ----
             place_err: Optional[str] = None
             if settings.kite.PAPER_TRADE:
-                simulated_id   = f"PAPER-{signal.symbol}-{idx}-{int(time.time())}"
-                simulated_fill = signal.current_price   # Assume fill at signal price
+                simulated_id = f"PAPER-{signal.symbol}-{idx}-{int(time.time())}"
+                # Realistic slippage: ±0.10% based on direction.
+                # BUY  orders fill slightly above signal price (market lift).
+                # SELL orders fill slightly below signal price (market give).
+                # Additionally, each extra slice adds 0.02% of incremental impact
+                # to model queue/market-depth friction on large orders.
+                _slip_bps  = 10.0 + idx * 2.0          # basis points (10 bps base + 2/slice)
+                _slip_mult = 1.0 + (_slip_bps / 10_000)
+                if signal.direction.value.upper() in ("BUY", "LONG"):
+                    simulated_fill = round(signal.current_price * _slip_mult, 2)
+                else:
+                    simulated_fill = round(signal.current_price / _slip_mult, 2)
                 order_id, fill_price = simulated_id, simulated_fill
                 logger.info(
-                    "[PAPER] Simulated order: %s %s %d shares @ ₹%.2f | id=%s",
+                    "[PAPER] Simulated order: %s %s %d shares @ ₹%.2f "
+                    "(signal ₹%.2f, slip=%.1f bps) | id=%s",
                     signal.direction.value, signal.symbol,
-                    order_slice.quantity, simulated_fill, simulated_id,
+                    order_slice.quantity, simulated_fill,
+                    signal.current_price, _slip_bps, simulated_id,
                 )
             else:
                 order_id, fill_price, place_err = await self._place_single_order(

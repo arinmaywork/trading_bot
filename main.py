@@ -668,32 +668,53 @@ async def strategy_loop(
             await asyncio.sleep(interval)
             continue
 
-        # ---- Sentiment + Real GRI (both cached/non-blocking) ----
+        # ---- GRI + Sentiment (both cached/non-blocking) ----
+        # FIX B-18 (Bug #5): Assign gri HERE — before any continue statements — so
+        # bot_state.update() always has fresh GRI data regardless of trading mode.
+        # Previously gri was assigned after the paused/paper_monitor continues,
+        # which left last_gri=0.000, last_gri_level='UNKNOWN' in /status permanently.
+        prev_gri_val = _prev_gri
+        gri          = geo_monitor.current
         sentiment    = alt_data.sentiment
         weather_anom = alt_data.weather.get_aggregate_anomaly()
 
-        # ── Apply trading mode ─────────────────────────────────────────
+        # FIX B-18 (Bug #2 / #9): In GRI-only mode, ALWAYS recompute synthetic
+        # sentiment on EVERY cycle from the latest GRI value.
+        # Previously: only ran when sentiment_score == 0.0 (i.e., only on first cycle
+        # when Gemini had never run). On subsequent cycles, score was non-zero from
+        # the first synthetic pass so the block was never re-entered, meaning GRI
+        # changes never propagated to update the sentiment signal throughout the day.
+        if bot_state and bot_state.mode.value == "gri_only":
+            from alternative_data import SentimentResult as _SR
+            gri_score = (gri.composite - 0.30) * -2.5
+            gri_score = max(-0.8, min(0.8, gri_score))
+            sentiment = _SR(
+                sentiment_classification="Fear"      if gri_score < -0.15 else
+                                         "Excitement" if gri_score > 0.15  else "Neutral",
+                sentiment_score=round(gri_score, 4),
+                rationale=f"GRI-synthetic: GRI={gri.composite:.3f} ({gri.level})",
+                source_articles=[], key_entities=[], model_latency_ms=0.0,
+                risk_context="", volatility_context=gri.level, gpr_context="",
+            )
+
+        # FIX B-18 (Bug #5): Update bot_state with live GRI/sentiment BEFORE any
+        # continue statements so /status always reflects current data.
+        if bot_state:
+            bot_state.update(
+                last_gri=gri.composite, last_gri_level=gri.level,
+                last_vix=gri.india_vix, last_usdinr=gri.usdinr,
+                last_sentiment=sentiment.sentiment_score,
+                last_sentiment_class=sentiment.sentiment_classification,
+                last_alpha_mult=gri.alpha_multiplier,
+                last_kelly_mult=gri.kelly_multiplier,
+                gemini_working=(bot_state.mode.value != "gri_only" and
+                                sentiment.sentiment_score != 0.0),
+            )
+
+        # ── Apply trading mode guards ──────────────────────────────────
         if bot_state and bot_state.paused:
             await asyncio.sleep(1)
             continue
-
-        # B-02 FIX: assign gri BEFORE it is referenced in the gri_only block
-        prev_gri_val = _prev_gri
-        gri          = geo_monitor.current
-
-        if bot_state and bot_state.mode.value == "gri_only":
-            if sentiment.sentiment_score == 0.0:
-                from alternative_data import SentimentResult as _SR
-                gri_score = (gri.composite - 0.30) * -2.5
-                gri_score = max(-0.8, min(0.8, gri_score))
-                sentiment = _SR(
-                    sentiment_classification="Fear" if gri_score < -0.15 else
-                                             "Excitement" if gri_score > 0.15 else "Neutral",
-                    sentiment_score=round(gri_score, 4),
-                    rationale=f"GRI-synthetic: GRI={gri.composite:.3f}",
-                    source_articles=[], key_entities=[], model_latency_ms=0.0,
-                    risk_context="", volatility_context="", gpr_context="",
-                )
 
         if bot_state and bot_state.mode.value == "paper_monitor":
             await asyncio.sleep(1)
@@ -1242,9 +1263,41 @@ async def main(kite: KiteConnect, access_token: str, tg_offset: int = 0) -> None
                 if not _is_market_open():
                     await asyncio.sleep(60); continue
 
-                # ── GRI-only mode: skip Gemini entirely ──────────────────────
+                # ── GRI-only mode: synthesise sentiment from GRI; no Gemini ──
                 if bot_state and bot_state.mode.value == "gri_only":
-                    await asyncio.sleep(60); continue
+                    from alternative_data import SentimentResult as _SR
+                    _gri_now   = geo_monitor.current
+                    _gri_score = (_gri_now.composite - 0.30) * -2.5
+                    _gri_score = max(-0.8, min(0.8, _gri_score))
+                    _gri_result = _SR(
+                        sentiment_classification=(
+                            "Fear"      if _gri_score < -0.15 else
+                            "Excitement" if _gri_score >  0.15 else "Neutral"
+                        ),
+                        sentiment_score=round(_gri_score, 4),
+                        rationale=(
+                            f"GRI-synthetic: GRI={_gri_now.composite:.3f} "
+                            f"({_gri_now.level}) VIX={_gri_now.india_vix:.1f}"
+                        ),
+                        source_articles=[], key_entities=[], model_latency_ms=0.0,
+                        risk_context="GRI-only mode", volatility_context=_gri_now.level,
+                        gpr_context="",
+                    )
+                    alt_data.update_sentiment(_gri_result)
+                    logger.info(
+                        "GRI-synthetic sentiment: %s score=%.3f | GRI=%.3f (%s)",
+                        _gri_result.sentiment_classification,
+                        _gri_result.sentiment_score,
+                        _gri_now.composite, _gri_now.level,
+                    )
+                    if bot_state is not None:
+                        _shb = bot_state.task_heartbeats.setdefault(
+                            "sentiment_loop", {"cycles": 0, "errors": 0}
+                        )
+                        _shb["last_beat"] = time.time()
+                        _shb["cycles"]   += 1
+                    await asyncio.sleep(60)
+                    continue
 
                 # ── All models exhausted: back off until soonest slot is free ─
                 from agent_pipeline import _rotator as _gm_rotator  # noqa: PLC0415

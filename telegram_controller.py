@@ -256,13 +256,19 @@ class TelegramController:
         }
 
     async def send_mode_selector(self) -> None:
-        gemini_status = "✅ Gemini quota available" if self._state.gemini_working \
-                        else "⚠️ Gemini quota exhausted — GRI-Only recommended"
+        # Show Gemini quota state honestly so the user can pick the right mode
+        gri_val = self._state.last_gri
+        gri_emoji = "🟢" if gri_val < 0.30 else ("🟡" if gri_val < 0.50 else "🔴")
+        if self._state.gemini_working:
+            gemini_status = "✅ Gemini quota available — Full mode recommended"
+        else:
+            gemini_status = "⚠️ Gemini quota exhausted — GRI-Only recommended"
         text = (
             f"🤖 <b>SentiStack V2 — Choose Trading Mode</b>\n"
             f"{'─' * 34}\n"
             f"🕐 <b>Started:</b> {_fmt_time()}\n"
-            f"🌐 <b>Gemini:</b> {gemini_status}\n\n"
+            f"🌐 <b>GRI:</b> {gri_emoji} {gri_val:.3f} ({self._state.last_gri_level})\n"
+            f"🧠 <b>Gemini:</b> {gemini_status}\n\n"
             f"Please select how you want the bot to trade today:\n"
         )
         await self.send(text, reply_markup=self._mode_keyboard())
@@ -281,7 +287,14 @@ class TelegramController:
         sent_emoji = {"Fear": "😨", "Excitement": "🚀", "Neutral": "😐"}.get(
             s.last_sentiment_class, "😐"
         )
-        gemini_str = "✅ Working" if s.gemini_working else "❌ Quota exhausted"
+        # Bug fix: in GRI-only mode Gemini is intentionally not used — show that
+        # clearly instead of the alarming "Quota exhausted" message.
+        if s.mode == TradingMode.GRI_ONLY:
+            gemini_str = "⚡ Not used (GRI-synthetic mode)"
+        elif s.gemini_working:
+            gemini_str = "✅ Working"
+        else:
+            gemini_str = "❌ Quota exhausted"
         elapsed = _ist_now() - s.start_time
         hours, rem = divmod(int(elapsed.total_seconds()), 3600)
         mins = rem // 60
