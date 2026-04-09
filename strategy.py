@@ -444,26 +444,28 @@ class RiskManager:
             cost   = _round_trip_cost(final)
             exp_pl = _expected_pnl(final)
 
-            if exp_pl < cost:
+            # R-12: Safety margin — profit should be at least 2.0x the round-trip cost
+            # to account for slippage and execution latency.
+            if exp_pl < 2.0 * cost:
                 # Kelly qty is too small — try bumping up to MIN_TRADE_VALUE
                 min_qty = math.ceil(cfg_costs.MIN_TRADE_VALUE / current_price)
                 min_qty = max(min_qty, final)
                 max_allowed = int(cfg_costs.MAX_POSITION_FRACTION * self._capital / current_price)
-                if min_qty <= max_allowed and _expected_pnl(min_qty) > _round_trip_cost(min_qty):
+                if min_qty <= max_allowed and _expected_pnl(min_qty) > 2.0 * _round_trip_cost(min_qty):
                     logger.info(
-                        "CostFilter %s: bumping qty %d→%d to clear brokerage hurdle "
+                        "CostFilter %s: bumping qty %d→%d to clear 2x brokerage hurdle "
                         "(exp_pnl=₹%.2f cost=₹%.2f)",
                         symbol, final, min_qty, _expected_pnl(min_qty), _round_trip_cost(min_qty),
                     )
                     final = min_qty
                 else:
                     logger.info(
-                        "CostFilter %s: skipping — exp_pnl=₹%.2f < cost=₹%.2f "
+                        "CostFilter %s: skipping — exp_pnl=₹%.2f < 2x cost=₹%.2f "
                         "(brokerage+STT hurdle not cleared even at min_trade_value=₹%.0f)",
                         symbol, exp_pl, cost, cfg_costs.MIN_TRADE_VALUE,
                     )
                     return 0, f_final, f_busseti, False, (
-                        f"Trade cost ₹{cost:.2f} > expected P&L ₹{exp_pl:.2f} — "
+                        f"Trade cost ₹{cost:.2f} too high vs exp P&L ₹{exp_pl:.2f} (2x hurdle) — "
                         f"increase capital or wait for stronger signal"
                     )
         # ── End cost filter ──────────────────────────────────────────────────
@@ -489,6 +491,27 @@ def geo_alpha_multiplier(gri_composite: float) -> float:
     if gri_composite >= 0.65:
         return 0.0
     return round(1.0 - (gri_composite - 0.25) / (0.65 - 0.25), 4)
+
+
+def compute_rsi(closes: List[float], period: int = 14) -> float:
+    """Standard Relative Strength Index (RSI)."""
+    if len(closes) < period + 1:
+        return 50.0  # Neutral
+    
+    # Prices are in reverse order (newest first), flip them
+    prices = np.array(closes[::-1])
+    deltas = np.diff(prices)
+    gains = np.where(deltas > 0, deltas, 0.0)
+    losses = np.where(deltas < 0, -deltas, 0.0)
+    
+    avg_gain = np.mean(gains[:period])
+    avg_loss = np.mean(losses[:period])
+    
+    if avg_loss == 0:
+        return 100.0
+    
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1 + rs))
 
 
 # ---------------------------------------------------------------------------
@@ -590,9 +613,29 @@ class StrategyEngine:
         )
 
         # ── 6. Direction ───────────────────────────────────────────────
+        # R-12: Enhanced Signal Filtering (VWAP + RSI)
+        # Prevents counter-trend entries and buying into overbought conditions.
+        rsi = compute_rsi(closes)
+        trend_aligned = (
+            (ml_signal > 0 and current_price > vwap) or
+            (ml_signal < 0 and current_price < vwap)
+        )
+        rsi_neutral = (
+            (ml_signal > 0 and rsi < 70) or
+            (ml_signal < 0 and rsi > 30)
+        )
+
         if is_decayed or abs(ml_signal) < settings.strategy.MIN_ALPHA_THRESHOLD:
             direction = TradeDirection.FLAT
             qty       = 0
+        elif not trend_aligned:
+            direction = TradeDirection.FLAT
+            qty       = 0
+            size_reason += " | FLAT: Trend divergence (Price vs VWAP)"
+        elif not rsi_neutral:
+            direction = TradeDirection.FLAT
+            qty       = 0
+            size_reason += f" | FLAT: RSI extremum ({rsi:.1f})"
         elif ml_signal > 0:
             direction = TradeDirection.BUY
         else:
@@ -601,7 +644,7 @@ class StrategyEngine:
         rationale = (
             f"ML: signal={signal_out.signal:+.4f} geo_adj={ml_signal:+.4f} "
             f"({'fallback' if signal_out.is_fallback else f'v{signal_out.model_version}'}) "
-            f"conf={signal_out.confidence:.2f} dir={direction.value} "
+            f"conf={signal_out.confidence:.2f} RSI={rsi:.1f} dir={direction.value} "
             f"| MLOFI={mlofi:+.3f} OFI={ofi:+.3f} AFR={aflow.get('ratio',0):+.3f} "
             f"| VWAP={vwap:.2f} σ={vol:.2%} "
             f"| S={sentiment.sentiment_score:+.3f} ({sentiment.sentiment_classification}) "

@@ -265,6 +265,16 @@ class StrategyConfig:
     SQUARE_OFF_MINUTE_IST:       int   = 15
 
     # ---------------------------------------------------------------------------
+    # R-12: Trailing Stop Loss (TSL) & Risk Management
+    # ---------------------------------------------------------------------------
+    # TSL_ACTIVATION_PCT: Profit % at which TSL starts trailing (e.g. 0.6%)
+    # TSL_CALLBACK_PCT:   % distance from peak price to trigger exit (e.g. 0.3%)
+    # HARD_STOP_LOSS_PCT: Max loss from entry price before emergency exit (e.g. 1.0%)
+    TSL_ACTIVATION_PCT:   float = 0.006   # 0.6% profit triggers TSL
+    TSL_CALLBACK_PCT:     float = 0.003   # 0.3% trailing buffer
+    HARD_STOP_LOSS_PCT:   float = 0.012   # 1.2% hard stop
+
+    # ---------------------------------------------------------------------------
     # R-11: CNC / MIS Hybrid Strategy
     # ---------------------------------------------------------------------------
     # Signals with high ML confidence AND generated before CNC_ENTRY_CUTOFF_HOUR

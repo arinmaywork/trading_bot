@@ -69,6 +69,7 @@ from strategy import RiskManager, StrategyEngine, TradeDirection
 from ml_signal import EnsembleSignalEngine
 from geopolitical import GeopoliticalRiskMonitor
 from universe import FrequencyOptimiser, UniverseEngine
+from position_manager import PositionManager
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -496,6 +497,7 @@ async def strategy_loop(
     freq_optimiser: FrequencyOptimiser,
     ws_manager: WebSocketSubscriptionManager,
     telegram: "TelegramNotifier",   # B-01 FIX: was missing from signature
+    pos_manager: PositionManager,   # R-12: Added PositionManager
     logbook: Any = None,
     bot_state: Any = None,
 ) -> None:
@@ -505,6 +507,7 @@ async def strategy_loop(
       • Full universe evaluation each cycle (batch LTP).
       • WebSocket resubscription applied when universe changes.
       • Macro signals pushed to UniverseEngine for live sector scoring.
+      • PositionManager evaluates TSL/SL exits every cycle.
     """
     logger.info("Strategy loop started.")
     # B-17 FIX: use plain local variables instead of function attributes
@@ -527,6 +530,7 @@ async def strategy_loop(
     class _LoopState:
         squareoff_done_today: bool = False
         squareoff_date: Optional[date] = None
+        pos_seeded: bool = False   # Flag: seed pos_manager on first successful fetch
     _strategy_loop_state = _LoopState()
 
     while True:
@@ -719,9 +723,64 @@ async def strategy_loop(
                             _open_positions[sym] = qty
                 if _open_positions:
                     logger.debug("Open MIS positions: %s", _open_positions)
+                    
+                # R-12: Seed PositionManager on startup using first position fetch
+                if not _strategy_loop_state.pos_seeded:
+                    for sym, qty in _open_positions.items():
+                        if qty != 0:
+                            # We don't have entry price for pre-existing trades, 
+                            # use current LTP as a neutral baseline.
+                            _ltp = ltp_map.get(sym, 0.0)
+                            if _ltp > 0:
+                                pos_manager.on_trade_executed(
+                                    sym, 
+                                    TradeDirection.BUY if qty > 0 else TradeDirection.SELL,
+                                    _ltp, abs(qty)
+                                )
+                    _strategy_loop_state.pos_seeded = True
             except Exception as exc:
                 logger.warning("Positions fetch failed (skipping guard this cycle): %s", exc)
                 # Keep _open_positions from the previous cycle as a best-effort fallback
+
+        # ── R-12: Evaluate TSL/SL exits from PositionManager ─────────────────
+        if _open_positions:
+            exits = pos_manager.update(ltp_map)
+            for sym, qty, exit_dir, reason in exits:
+                logger.warning("TSL/SL Triggered for %s: %s", sym, reason)
+                await telegram.send(
+                    f"🛑 <b>RISK EXIT: {sym}</b>\n"
+                    f"{'─' * 30}\n"
+                    f"<b>Reason:</b> {reason}\n"
+                    f"<b>Action:</b> {exit_dir.value} (Close {qty} shares)\n"
+                )
+                
+                # Execute exit order
+                # We use a dummy SignalState to trigger a closing order
+                from strategy import SignalState
+                
+                exit_sig = SignalState(
+                    symbol=sym, timestamp=datetime.now(timezone.utc),
+                    current_price=ltp_map.get(sym, 0.0), vwap=ltp_map.get(sym, 0.0),
+                    ofi=0.0, mlofi=0.0, aflow_ratio=0.0,
+                    sentiment_score=0.0, sentiment_class="RiskExit",
+                    ml_signal=0.0, ml_confidence=1.0, ml_model_version="exit",
+                    ml_is_fallback=True, alpha_raw=0.0, alpha=0.0,
+                    direction=exit_dir, quantity=qty, position_fraction=0.0,
+                    busseti_f=0.0, vol_regime=0.0, geo_risk=0.0,
+                    geo_level="RiskExit", geo_alpha_multiplier=1.0,
+                    geo_kelly_multiplier=1.0, is_decayed=False,
+                    rationale=f"Risk Manager Exit: {reason}",
+                    product_type=settings.kite.PRODUCT
+                )
+                report = await executor.execute(exit_sig)
+                if report.success:
+                    # Update local position count and clear cooldown
+                    _open_positions[sym] = 0
+                    if sym in _order_cooldowns:
+                        del _order_cooldowns[sym]
+                else:
+                    # Exit failed! Put it back in _open_positions to retry next cycle
+                    logger.error("Risk Exit FAILED for %s. Will retry via position-sync.", sym)
 
         # ── R-10: Forced square-off at 3:15 PM IST ───────────────────────────
         # Zerodha auto-squares all open MIS positions at ~3:20 PM and charges
@@ -920,6 +979,11 @@ async def strategy_loop(
                     # Set cooldown so this symbol is blocked for SIGNAL_COOLDOWN_S
                     if report.success:
                         _order_cooldowns[symbol] = time.monotonic()
+                        
+                        # R-12: Register new position with manager
+                        pos_manager.on_trade_executed(
+                            symbol, sig.direction, report.avg_fill_price or price, report.total_quantity
+                        )
 
                         # In paper mode, track simulated positions in-memory so
                         # the position guard works correctly between cycles.
@@ -1089,6 +1153,7 @@ async def main(kite: KiteConnect, access_token: str, tg_offset: int = 0) -> None
     logger.info("TelegramLogHandler installed — ERROR logs will be forwarded to Telegram.")
     strategy_engine = StrategyEngine(redis_client, risk_manager, ml_engine)
     executor        = OrderExecutor(kite, rate_limiter, telegram)
+    pos_manager     = PositionManager()   # R-12: Position tracking engine
 
     print_banner("Geopolitical Risk Feed")
     await geo_monitor.initialise()
@@ -1288,6 +1353,7 @@ async def main(kite: KiteConnect, access_token: str, tg_offset: int = 0) -> None
             rate_limiter=rate_limiter, freq_optimiser=freq_optimiser,
             ws_manager=ws_manager,
             telegram=telegram,  # B-01 FIX: pass telegram notifier
+            pos_manager=pos_manager, # R-12: Risk management
             logbook=logbook, bot_state=bot_state,
         ), name="strategy_loop",
     )
