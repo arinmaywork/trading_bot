@@ -1059,6 +1059,9 @@ async def main(kite: KiteConnect, access_token: str, tg_offset: int = 0) -> None
     tg_controller.set_kite(kite, settings.kite.API_SECRET)
     # R-11: Register logbook so /pnl command can pull today's trade data.
     tg_controller.set_logbook(logbook)
+    # Wire ModelRotator so /resetquota command can clear stale Gemini quota state.
+    from agent_pipeline import _rotator as _gm_rotator_ref
+    tg_controller.set_rotator(_gm_rotator_ref)
     # Wire Telegram ERROR log forwarding — any ERROR/CRITICAL log line is
     # sent to the Telegram chat automatically (rate-limited to 1 per 30 s).
     _tg_log_handler = TelegramLogHandler(

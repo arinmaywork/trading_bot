@@ -159,6 +159,8 @@ class TelegramController:
         self._token_cache_file = Path(__file__).parent / ".kite_token"
         # Logbook reference — populated by main.py via set_logbook()
         self._logbook          = None
+        # ModelRotator reference — populated by main.py via set_rotator()
+        self._rotator          = None
 
     # ── Token hot-swap ────────────────────────────────────────────────────
 
@@ -183,6 +185,14 @@ class TelegramController:
         Call this once from main.py after the logbook is initialised.
         """
         self._logbook = logbook
+
+    def set_rotator(self, rotator: Any) -> None:
+        """
+        Register the ModelRotator singleton so /resetquota can clear
+        stale Gemini quota state without restarting the bot.
+        Call once from main.py: tg_controller.set_rotator(_rotator)
+        """
+        self._rotator = rotator
 
     def _save_token_cache(self, token: str) -> None:
         try:
@@ -330,6 +340,7 @@ class TelegramController:
                 f"{'─' * 28}\n"
                 "🔧 <b>Health &amp; Monitoring</b>\n"
                 "/tasks — Background task heartbeat status\n"
+                "/resetquota — Clear stale Gemini quota cooldowns\n"
                 f"{'─' * 28}\n"
                 "📊 <b>P&amp;L &amp; Capital</b>\n"
                 "/pnl — Today's P&amp;L statement (MIS + CNC)\n"
@@ -534,6 +545,21 @@ class TelegramController:
                     "⚠️ Usage: <code>/capital &lt;amount&gt;</code>\n"
                     "Example: <code>/capital 500000</code>\n"
                     "Strips ₹ and commas automatically."
+                )
+
+        elif cmd == "/resetquota":
+            # ── Gemini quota emergency reset ─────────────────────────────────
+            if self._rotator is None:
+                await self.send(
+                    "⚠️ <b>ModelRotator not wired.</b>\n"
+                    "Call tg_controller.set_rotator(_rotator) in main.py."
+                )
+            else:
+                summary = self._rotator.reset_all_quota_state()
+                await self.send(
+                    f"🔄 <b>Gemini quota state cleared.</b>\n"
+                    f"<pre>{summary}</pre>\n"
+                    f"All models are now available. The bot will retry Gemini on the next sentiment cycle."
                 )
 
         elif cmd == "/stop":

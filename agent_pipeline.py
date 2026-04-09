@@ -107,15 +107,21 @@ class ModelRotator:
     """
     Manages a priority-ordered pool of Gemini models.
 
-    Design principles (free-tier optimised):
-      • Flash-first: use high-quota Flash models (1500 RPD) for routine calls.
-      • Pro-reserved: Pro models (25-50 RPD) only for high-GRI / opening / close.
+    Design principles (free-tier optimised, April 2026):
+      • Flash-first: 2.5-Flash (250 RPD) as primary, 2.5-Flash-Lite (1000 RPD) as backup.
+      • Pro-reserved: 2.5-Pro (100 RPD) only for high-GRI / opening / close risk analysis.
       • Proactive RPM enforcement: never fire if already at RPM limit for that model.
       • RPD tracking: count daily calls per model; warn when nearing limit.
       • Differentiated cooldown: RPM hit → 65s; RPD exhausted → 24h.
       • RiskManagerAgent gated: only fire the second LLM call when Pro quota is available.
 
     Pool order = Flash models first (normal use), Pro models last (reserved).
+
+    DEPRECATED / RETIRED models (DO NOT use):
+      gemini-2.0-flash       retired March 3, 2026  → returns 404
+      gemini-2.0-flash-lite  retired March 3, 2026  → returns 404
+      gemini-1.5-flash       deprecated             → returns 404
+      gemini-1.5-pro         deprecated             → returns 404
 
     Call-frequency tiers (returned by `recommended_interval_s`):
       Opening      → 180 s   (09:15–09:45)
@@ -127,15 +133,22 @@ class ModelRotator:
       LOW + calm   → 600 s   (conserve budget)
     """
 
-    # Pool in selection priority order.
-    # Flash models first — they have 1500 RPD on free tier.
-    # Pro models last  — they have only 25-50 RPD; reserved for high-risk moments.
+    # Pool in selection priority order — UPDATED April 2026.
+    #
+    # RETIRED / DEPRECATED (do NOT add back):
+    #   gemini-2.0-flash     — retired March 3, 2026 (returns 404)
+    #   gemini-2.0-flash-lite — retired March 3, 2026 (returns 404)
+    #   gemini-1.5-flash     — deprecated (returns 404)
+    #   gemini-1.5-pro       — deprecated (returns 404)
+    #
+    # Current free-tier models (April 2026):
+    #   gemini-2.5-flash      → 10 RPM, 250 RPD  (primary quality model)
+    #   gemini-2.5-flash-lite → 15 RPM, 1000 RPD (high-volume fallback)
+    #   gemini-2.5-pro        → 5 RPM,  100 RPD  (reserved for risk manager)
     _POOL: List[_ModelSlot] = [
-        _ModelSlot("gemini-2.5-flash", "2.5 Flash", quality=4, rpm_limit=10, rpd_limit=500,  tier="flash"),
-        _ModelSlot("gemini-2.0-flash", "2.0 Flash", quality=4, rpm_limit=15, rpd_limit=1500, tier="flash"),
-        _ModelSlot("gemini-1.5-flash", "1.5 Flash", quality=3, rpm_limit=15, rpd_limit=1500, tier="flash"),
-        _ModelSlot("gemini-2.5-pro",   "2.5 Pro",   quality=5, rpm_limit=5,  rpd_limit=25,   tier="pro"),
-        _ModelSlot("gemini-1.5-pro",   "1.5 Pro",   quality=5, rpm_limit=2,  rpd_limit=50,   tier="pro"),
+        _ModelSlot("gemini-2.5-flash",      "2.5 Flash",      quality=4, rpm_limit=10, rpd_limit=250,  tier="flash"),
+        _ModelSlot("gemini-2.5-flash-lite",  "2.5 Flash-Lite", quality=3, rpm_limit=15, rpd_limit=1000, tier="flash"),
+        _ModelSlot("gemini-2.5-pro",         "2.5 Pro",        quality=5, rpm_limit=5,  rpd_limit=100,  tier="pro"),
     ]
 
     # Cooldowns: separate RPM vs RPD exhaustion
@@ -388,7 +401,11 @@ class ModelRotator:
 
     def mark_not_found(self, slot: _ModelSlot) -> None:
         slot.cooldown_until = time.time() + self._RPD_COOLDOWN_S
-        logger.error("ModelRotator: %s returned 404 — disabling for today.", slot.display)
+        # Set rpd_date so _load_quota_state can restore this cooldown after a restart.
+        # Without this the model is probed (and 404s) on every restart instead of
+        # staying disabled for the rest of the IST day.
+        slot.rpd_date = datetime.now(_IST).strftime("%Y-%m-%d")
+        logger.error("ModelRotator: %s returned 404/retired — disabling for today.", slot.display)
         self._save_quota_state()
 
     # ── Interval recommendation ───────────────────────────────────────────
@@ -419,6 +436,47 @@ class ModelRotator:
         return any(
             s.tier == "pro" and self._slot_available(s)
             for s in self._slots
+        )
+
+    def reset_all_quota_state(self) -> str:
+        """
+        Emergency reset: wipe all in-memory cooldowns and delete the quota state file.
+        Called by the /resetquota Telegram command when the bot is stuck in a
+        quota-exhausted state (e.g. after a bad code run left stale 24h cooldowns).
+        Returns a human-readable summary of what was reset.
+        """
+        import copy
+        lines = []
+        for s in self._slots:
+            cd_remaining = max(0.0, s.cooldown_until - time.time())
+            if cd_remaining > 0 or s.rpd_today > 0:
+                lines.append(
+                    f"  {s.display}: RPD {s.rpd_today}/{s.rpd_limit}, "
+                    f"cooldown was {cd_remaining:.0f}s"
+                )
+            # Reset in-memory state completely
+            s.calls_made      = 0
+            s.calls_this_min  = 0
+            s.min_window_start = 0.0
+            s.rpd_today       = 0
+            s.rpd_date        = ""
+            s.errors_429      = 0
+            s.cooldown_until  = 0.0
+
+        # Delete persisted file
+        file_deleted = False
+        if self._QUOTA_STATE_FILE.exists():
+            try:
+                self._QUOTA_STATE_FILE.unlink()
+                file_deleted = True
+            except Exception as exc:
+                logger.warning("resetquota: could not delete quota file: %s", exc)
+
+        summary = "\n".join(lines) if lines else "  (all models were already clear)"
+        logger.warning("ModelRotator quota state RESET by operator command.\n%s", summary)
+        return (
+            f"✅ Quota state reset.\n{summary}\n"
+            f"{'State file deleted.' if file_deleted else 'State file not found.'}"
         )
 
     def daily_stats(self) -> Dict[str, Any]:
@@ -647,23 +705,19 @@ async def _call_gemini_with_rotation(
                 # DO NOT use "quota" alone — both RPM and RPD errors contain it.
                 # Treating RPM hits as daily would give Flash models a 24h ban
                 # from a simple per-minute rate limit, permanently disabling them.
-                #
-                # Fallback heuristics for short-form error messages that only say
-                # "RESOURCE_EXHAUSTED" without the quota-metric detail:
-                #   1. calls_made == 0 → we just started; can't have hit RPM yet
-                #      (RPM requires prior successful calls to fill the window)
-                #      → must be daily exhaustion from a previous run.
-                #   2. errors_429 >= 3 → three consecutive 429s even after RPM
-                #      cooldowns → window keeps exhausting → treat as daily.
                 err_lower = err_msg.lower()
                 is_daily = (
                     "per_day"       in err_lower    # Google standard RPD phrase
                     or "daily"      in err_lower    # generic / older SDK phrasing
                     or "limit: 0"   in err_msg      # free-tier: zero quota allocated
                     or "limit: 0.0" in err_msg
-                    # Heuristics for opaque "RESOURCE_EXHAUSTED" messages:
-                    or slot.calls_made == 0         # no successes → can't be RPM
-                    or slot.errors_429 >= 3         # repeated 429s → escalate
+                    # NOTE: removed 'calls_made == 0' and 'errors_429 >= 3' heuristics.
+                    # These caused a dangerous cascade: when fresh models (calls_made=0)
+                    # get ANY error on their first call, they would all be marked as
+                    # daily-exhausted and banned for 24 hours — even if the error was
+                    # a transient network issue, a model deprecation 404 (handled
+                    # separately), or a project-level RPM limit (which resets in 65s).
+                    # Trust only the explicit error message content for daily classification.
                 )
                 _rotator.mark_rate_limited(slot, is_daily=is_daily)
                 logger.warning("⟳ Model %s rate-limited%s — rotating.",
@@ -671,14 +725,22 @@ async def _call_gemini_with_rotation(
                 await asyncio.sleep(5)
                 continue
 
-            # Not Found handling
-            if "404" in err_msg or "NOT_FOUND" in err_msg:
+            # Not Found / Deprecated model handling
+            if "404" in err_msg or "NOT_FOUND" in err_msg or "GONE" in err_msg or "410" in err_msg:
                 _rotator.mark_not_found(slot)
-                logger.warning("⟳ Model %s not found — disabling.", slot.display)
+                logger.error(
+                    "⟳ Model %s not found/retired (HTTP 404/410) — disabling for today. "
+                    "Check model names: %s [%s]",
+                    slot.display, slot.api_name, type(exc).__name__,
+                )
                 continue
 
             # Other errors — treat as temporary RPM-style cooldown (is_daily=False)
-            logger.warning("⟳ Model %s error: %s — trying next.", slot.display, exc)
+            # Log the full exception TYPE so we can diagnose unexpected failures.
+            logger.warning(
+                "⟳ Model %s error [%s]: %s — applying short cooldown and trying next.",
+                slot.display, type(exc).__name__, repr(exc)[:200],
+            )
             _rotator.mark_rate_limited(slot, is_daily=False)
             await asyncio.sleep(5)
             continue
