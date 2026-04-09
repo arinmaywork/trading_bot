@@ -70,6 +70,7 @@ from ml_signal import EnsembleSignalEngine
 from geopolitical import GeopoliticalRiskMonitor
 from universe import FrequencyOptimiser, UniverseEngine
 from position_manager import PositionManager
+from portfolio_risk import PortfolioRiskMonitor
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -500,6 +501,7 @@ async def strategy_loop(
     pos_manager: PositionManager,   # R-12: Added PositionManager
     logbook: Any = None,
     bot_state: Any = None,
+    portfolio_risk: Optional["PortfolioRiskMonitor"] = None,  # R-13
 ) -> None:
     """
     Main evaluation loop with:
@@ -531,6 +533,9 @@ async def strategy_loop(
         squareoff_done_today: bool = False
         squareoff_date: Optional[date] = None
         pos_seeded: bool = False   # Flag: seed pos_manager on first successful fetch
+        risk_last_mono: float = 0.0      # R-13 throttle
+        margin_last_mono: float = 0.0    # R-14 throttle
+        margin_seeded: bool = False      # R-14 first-poll flag
     _strategy_loop_state = _LoopState()
 
     while True:
@@ -558,11 +563,111 @@ async def strategy_loop(
             _hb["last_beat"] = time.time()
             _hb["cycles"]   += 1
 
-        # ---- R-11: Sync paper capital from BotState if changed via /capital ----
-        if settings.kite.PAPER_TRADE and bot_state is not None:
-            _paper_cap = bot_state.paper_capital
-            if abs(_paper_cap - risk_manager._capital) > 1.0:
-                risk_manager.update_capital(_paper_cap)
+        # ---- R-11/R-13: Sync active capital from BotState on every cycle ----
+        # Single source of truth = bot_state.paper_capital (misnamed historically —
+        # it is the bot's live working capital in both paper and live modes).
+        # Any /capital command fans out to RiskManager (position sizing) and
+        # PortfolioRiskMonitor (D/W/M loss budgets).
+        if bot_state is not None:
+            _active_cap = bot_state.paper_capital
+            if _active_cap > 0 and abs(_active_cap - risk_manager._capital) > 1.0:
+                risk_manager.update_capital(_active_cap)
+                if portfolio_risk is not None:
+                    portfolio_risk.update_capital(_active_cap)
+                # Also update the settings shadow so new components that read
+                # TOTAL_CAPITAL at construction time pick up the new value.
+                try:
+                    settings.strategy.TOTAL_CAPITAL = _active_cap
+                except Exception:
+                    pass
+                logger.warning(
+                    "Active capital updated via /capital: ₹%.2f "
+                    "(RiskManager + PortfolioRisk synced).", _active_cap,
+                )
+
+        # ---- R-14: Auto-sync capital from Zerodha broker balance ----
+        # Only in LIVE mode, only if enabled, and throttled by
+        # AUTO_SYNC_INTERVAL_S. Safety buffer keeps some margin headroom.
+        if (
+            not settings.kite.PAPER_TRADE
+            and getattr(settings.strategy, "AUTO_SYNC_CAPITAL", False)
+            and bot_state is not None
+        ):
+            _msync_interval = float(getattr(settings.strategy, "AUTO_SYNC_INTERVAL_S", 300))
+            _now_mono_m     = time.monotonic()
+            if (_now_mono_m - _strategy_loop_state.margin_last_mono) >= _msync_interval:
+                _strategy_loop_state.margin_last_mono = _now_mono_m
+                try:
+                    _margins = await executor.get_margins()
+                    _equity  = (_margins or {}).get("equity", {}) or {}
+                    # Prefer equity.net (available for trading), fall back to
+                    # equity.available.live_balance for older API schemas.
+                    _raw_bal = float(
+                        _equity.get("net")
+                        or ((_equity.get("available") or {}).get("live_balance"))
+                        or ((_equity.get("available") or {}).get("cash"))
+                        or 0.0
+                    )
+                    if _raw_bal <= 0:
+                        logger.warning(
+                            "R-14 broker margin poll returned zero balance; "
+                            "skipping auto-sync this cycle."
+                        )
+                    else:
+                        _buffer = float(getattr(
+                            settings.strategy, "AUTO_SYNC_SAFETY_BUFFER", 0.90
+                        ))
+                        _ceiling = float(getattr(
+                            settings.strategy, "AUTO_SYNC_MAX_CAPITAL", 1e7
+                        ))
+                        _new_cap = min(_raw_bal * _buffer, _ceiling)
+                        _cur_cap = bot_state.paper_capital
+                        _min_delta_pct = float(getattr(
+                            settings.strategy, "AUTO_SYNC_MIN_DELTA_PCT", 0.01
+                        ))
+                        _delta = abs(_new_cap - _cur_cap) / max(_cur_cap, 1.0)
+                        # On first poll, always apply (seed from broker).
+                        if (not _strategy_loop_state.margin_seeded) or _delta >= _min_delta_pct:
+                            bot_state.paper_capital = _new_cap
+                            _strategy_loop_state.margin_seeded = True
+                            logger.warning(
+                                "R-14 broker capital auto-sync: "
+                                "raw=₹%.2f × buffer=%.2f → active=₹%.2f "
+                                "(was ₹%.2f, delta=%.1f%%). "
+                                "RiskManager + PortfolioRisk will resync next cycle.",
+                                _raw_bal, _buffer, _new_cap, _cur_cap, _delta * 100,
+                            )
+                            try:
+                                await telegram.send_message(
+                                    f"💰 <b>Capital auto-synced from Zerodha</b>\n"
+                                    f"Broker balance: ₹{_raw_bal:,.2f}\n"
+                                    f"Safety buffer: {_buffer:.0%}\n"
+                                    f"Active capital: <b>₹{_new_cap:,.2f}</b>\n"
+                                    f"(was ₹{_cur_cap:,.2f})"
+                                )
+                            except Exception:
+                                pass
+                except Exception as _m_exc:
+                    logger.error("R-14 margin auto-sync failed: %s", _m_exc)
+
+        # ---- R-13: Portfolio-level risk budget check (throttled) ----
+        if portfolio_risk is not None and bot_state is not None:
+            _risk_interval = float(getattr(settings.strategy, "RISK_CHECK_INTERVAL_S", 60))
+            _now_mono = time.monotonic()
+            if (_now_mono - _strategy_loop_state.risk_last_mono) >= _risk_interval:
+                try:
+                    _budget, _changed, _reason = portfolio_risk.check(bot_state)
+                    _strategy_loop_state.risk_last_mono = _now_mono
+                    if _changed and _reason:
+                        logger.warning("R-13 RISK HALT TRANSITION: %s", _reason)
+                        try:
+                            await telegram.send_message(
+                                f"🚨 <b>Risk halt transition</b>\n{_reason}"
+                            )
+                        except Exception as _tg_exc:
+                            logger.error("Risk halt Telegram alert failed: %s", _tg_exc)
+                except Exception as _risk_exc:
+                    logger.exception("PortfolioRiskMonitor.check failed: %s", _risk_exc)
 
         # ---- Push latest macro + geo signals to universe engine ----
         logger.info("Strategy loop [cycle %d]: updating macro signals...", cycle_num)
@@ -959,6 +1064,14 @@ async def strategy_loop(
                         )
                         continue
 
+                    # ── R-13: Symbol blacklist (consecutive-loss guard) ────
+                    if bot_state and symbol in getattr(bot_state, "risk_blacklist", set()):
+                        logger.info(
+                            "R-13 blacklist: skipping %s (consecutive losses today)",
+                            symbol,
+                        )
+                        continue
+
                     # ── Cooldown guard ─────────────────────────────────────
                     now_mono = time.monotonic()
                     last_ts  = _order_cooldowns.get(symbol, 0.0)
@@ -1001,9 +1114,14 @@ async def strategy_loop(
                     if report.success:
                         _order_cooldowns[symbol] = time.monotonic()
                         
-                        # R-12: Register new position with manager
+                        # R-12: Register new position with manager.
+                        # Bug 2.4 fix — forward σ_ann so stops are vol-scaled.
                         pos_manager.on_trade_executed(
-                            symbol, sig.direction, report.avg_fill_price or price, report.total_quantity
+                            symbol,
+                            sig.direction,
+                            report.avg_fill_price or price,
+                            report.total_quantity,
+                            sigma_ann=float(getattr(sig, "vol_regime", 0.20) or 0.20),
                         )
 
                         # In paper mode, track simulated positions in-memory so
@@ -1175,6 +1293,12 @@ async def main(kite: KiteConnect, access_token: str, tg_offset: int = 0) -> None
     strategy_engine = StrategyEngine(redis_client, risk_manager, ml_engine)
     executor        = OrderExecutor(kite, rate_limiter, telegram)
     pos_manager     = PositionManager()   # R-12: Position tracking engine
+    portfolio_risk_monitor = PortfolioRiskMonitor(
+        capital=settings.strategy.TOTAL_CAPITAL
+    )   # R-13: Portfolio loss-budget monitor
+    tg_controller.set_portfolio_risk(portfolio_risk_monitor)
+    # R-14: Wire broker-balance fetcher so /balance and /synccapital work.
+    tg_controller.set_margin_fetcher(executor.get_margins)
 
     print_banner("Geopolitical Risk Feed")
     await geo_monitor.initialise()
@@ -1408,6 +1532,7 @@ async def main(kite: KiteConnect, access_token: str, tg_offset: int = 0) -> None
             telegram=telegram,  # B-01 FIX: pass telegram notifier
             pos_manager=pos_manager, # R-12: Risk management
             logbook=logbook, bot_state=bot_state,
+            portfolio_risk=portfolio_risk_monitor,  # R-13
         ), name="strategy_loop",
     )
     sentiment_task    = asyncio.create_task(sentiment_loop(), name="sentiment_loop")

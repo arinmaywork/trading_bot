@@ -292,6 +292,56 @@ class StrategyConfig:
     CNC_ENTRY_CUTOFF_HOUR: int   = 13      # Only enter CNC positions before 1 PM IST
     CNC_MAX_HOLD_DAYS:     int   = 5       # Auto-exit CNC positions after this many days
 
+    # ---------------------------------------------------------------------------
+    # R-13: Portfolio-level loss limits (SENTISTACK_RETIREMENT_PLAN §3.1)
+    # ---------------------------------------------------------------------------
+    # Loss budgets are expressed as fractions of TOTAL_CAPITAL. When a budget is
+    # breached, portfolio_risk.py triggers the corresponding halt action via
+    # BotState:
+    #
+    #   DAILY_LOSS_LIMIT_PCT   → halt new entries until next IST session (09:15)
+    #   WEEKLY_LOSS_LIMIT_PCT  → halt new entries until next Monday 09:15 IST
+    #   MONTHLY_LOSS_LIMIT_PCT → full halt + switch to PAPER_MONITOR mode
+    #                            (requires manual /resume via Telegram)
+    #
+    # Consecutive-loss guard: if the same symbol closes MAX_CONSECUTIVE_LOSSES
+    # losing round-trips in a row on the same day, that symbol is blacklisted
+    # for the remainder of the session.
+    #
+    # These are intentionally CONSERVATIVE. A retirement-income bot must not
+    # blow past a monthly budget and "hope to recover" — the human gets notified
+    # and decides whether to re-engage.
+    DAILY_LOSS_LIMIT_PCT:     float = 0.02    # -2%  of capital
+    WEEKLY_LOSS_LIMIT_PCT:    float = 0.05    # -5%  of capital
+    MONTHLY_LOSS_LIMIT_PCT:   float = 0.08    # -8%  of capital
+    MAX_CONSECUTIVE_LOSSES:   int   = 3       # per symbol per session
+    RISK_CHECK_INTERVAL_S:    int   = 60      # re-evaluate risk budget every N sec
+    RISK_ENABLE_AUTOHALT:     bool  = True    # set False to log-only (dry run)
+
+    # ---------------------------------------------------------------------------
+    # R-14: Automatic capital sync from Zerodha broker balance
+    # ---------------------------------------------------------------------------
+    # When enabled, the bot polls kite.margins() on an interval and resizes
+    # the active trading capital to match the live equity balance reported by
+    # the broker (minus the safety buffer). Only active in LIVE mode — paper
+    # mode always uses the manual /capital value.
+    #
+    # Safety buffer: fraction of broker balance actually used for trading.
+    # e.g. 0.90 → trade with 90% of the balance, keeping 10% as headroom for
+    # slippage, costs, pending orders, and broker-side margin surprises.
+    #
+    # Min delta: only resize if the new balance differs from the current active
+    # capital by at least this fraction. Prevents churn on tiny swings.
+    AUTO_SYNC_CAPITAL:        bool  = field(
+        default_factory=lambda: _optional("AUTO_SYNC_CAPITAL", "false").lower() == "true"
+    )
+    AUTO_SYNC_INTERVAL_S:     int   = 300     # poll broker every 5 min
+    AUTO_SYNC_MIN_DELTA_PCT:  float = 0.01    # ignore changes < 1%
+    AUTO_SYNC_SAFETY_BUFFER:  float = 0.90    # use 90% of broker balance
+    AUTO_SYNC_MAX_CAPITAL:    float = field(
+        default_factory=lambda: float(_optional("AUTO_SYNC_MAX_CAPITAL", "10000000"))
+    )   # hard ceiling even if broker balance > this (₹1 crore default)
+
 
 # ---------------------------------------------------------------------------
 # Logging

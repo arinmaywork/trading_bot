@@ -211,9 +211,14 @@ class FeatureStore:
     Window size: MAX_WINDOW observations (configurable).
     """
 
-    MAX_WINDOW   = 200
-    MIN_TRAIN    = 50
-    REDIS_TTL    = 86400   # 24 h
+    # Bug 2.2 fix: 200 observations is guaranteed overfitting for XGBoost
+    # (80 estimators × depth 4 ≈ 400+ internal splits on 11 features).
+    # Raising to 5000 gives roughly 12-13 trading days of 1-minute bars per
+    # symbol, which is the minimum for stable out-of-sample behaviour.
+    # MIN_TRAIN is also raised so we don't fit on 50 samples.
+    MAX_WINDOW   = 5000
+    MIN_TRAIN    = 500
+    REDIS_TTL    = 7 * 86400   # 7 days — aligns with the larger window
 
     def __init__(self, redis_client: aioredis.Redis) -> None:
         self._redis = redis_client

@@ -384,29 +384,85 @@ class RiskManager:
         if abs(ml_signal) < self._cfg.MIN_ALPHA_THRESHOLD:
             return 0, 0.0, 0.0, False, f"Signal below threshold: {ml_signal:.6f}"
 
-        # Fetch return distribution from FeatureStore
-        returns = await get_return_distribution(redis_client, symbol)
+        # ── FIX (Bug 2.1): Parametric Kelly + Busseti VaR constraint ──
+        #
+        # Previous implementation flipped the unconditional historical return
+        # distribution by sign(ml_signal). That is mathematically wrong: it
+        # ignores signal magnitude entirely and treats a weak signal exactly
+        # the same as a strong one, and it uses the unconditional distribution
+        # instead of the distribution of returns *given the current signal*.
+        #
+        # The correct fix is a parametric approach. Treat `ml_signal` as an
+        # estimate of the expected 1-bar log return (already on the right
+        # scale since the ensemble is trained against fwd_log_return). Then:
+        #
+        #   μ  = |ml_signal|                (expected per-bar log return, signed)
+        #   σ  = per-bar realised stdev     (from annualised `vol`)
+        #   Kelly (log-optimal):  f* = μ / σ²
+        #   Busseti VaR cap:      require  P(1 + f·r < W_floor) ≤ ε
+        #                         assuming r ~ N(μ, σ²):
+        #                         f_max_var = (1 − W_floor) / (z·σ − μ)
+        #                         where z = Φ⁻¹(1 − ε)  (≈ 1.645 for ε=5%)
+        #
+        # The empirical Busseti bisection is still run as a *secondary safety
+        # cap* on the conditional return distribution (observations where the
+        # ML label had the same sign as the current signal), to pick up
+        # non-normal tail behaviour that the parametric model misses.
+        # --------------------------------------------------------------------
 
-        if len(returns) >= 20:
-            # Busseti (2016) bisection
-            # Scale ml_signal as directional weight on returns
-            # (positive signal → use raw returns; negative → flip sign)
-            directional_returns = [r * math.copysign(1.0, ml_signal) for r in returns]
-            f_busseti = busseti_kelly_bisection(
-                returns   = directional_returns,
-                epsilon   = self.BUSSETI_EPSILON,
-                w_floor   = self.BUSSETI_W_FLOOR,
-                f_max     = self._cfg.MAX_POSITION_FRACTION * 2,
-                n_iters   = self.BISECTION_ITERS,
-            )
-            method = f"Busseti(ε={self.BUSSETI_EPSILON}, Wf={self.BUSSETI_W_FLOOR}, n={len(returns)})"
+        BARS_PER_YEAR = 252 * 375        # NSE cash session minute bars
+        Z_EPSILON     = 1.645            # Φ⁻¹(0.95) → 5% VaR
+        vol_ann       = max(float(vol), 1e-4)
+        sigma_bar     = vol_ann / math.sqrt(BARS_PER_YEAR)
+        # The ensemble scales raw log-returns by MLConfig.SIGNAL_SCALE (20.0)
+        # so ml_signal ∈ [-1, 1] corresponds to expected_log_return ≈
+        # ml_signal / SIGNAL_SCALE. Undo the scaling here so μ is on the
+        # same units as σ_bar.
+        _SIGNAL_SCALE = getattr(settings.ml, "SIGNAL_SCALE", 20.0)
+        mu            = abs(float(ml_signal)) / max(_SIGNAL_SCALE, 1.0)
+
+        # Log-optimal Kelly
+        f_kelly = mu / (sigma_bar ** 2) if sigma_bar > 0 else 0.0
+        # Busseti parametric VaR cap
+        denom = Z_EPSILON * sigma_bar - mu
+        if denom > 1e-9:
+            f_var_cap = (1.0 - self.BUSSETI_W_FLOOR) / denom
         else:
-            # Not enough data — fall back to half-Kelly
-            vol_safe   = max(vol, 0.05)
-            full_kelly = abs(ml_signal) / (vol_safe ** 2)
-            f_busseti  = min(self._cfg.KELLY_FRACTION * full_kelly,
-                             self._cfg.MAX_POSITION_FRACTION)
-            method = "HalfKelly-fallback (insufficient return data)"
+            # μ > z·σ → signal edge dominates noise at the 5% VaR level;
+            # VaR constraint is not binding. Fall back to the position cap.
+            f_var_cap = self._cfg.MAX_POSITION_FRACTION * 2.0
+
+        f_param = min(f_kelly, f_var_cap, self._cfg.MAX_POSITION_FRACTION * 2.0)
+        # Apply fractional-Kelly haircut (safety: never sit at full Kelly live)
+        f_param *= self._cfg.KELLY_FRACTION
+
+        # Secondary empirical cap from conditional return distribution
+        raw_returns = await get_return_distribution(redis_client, symbol)
+        if raw_returns and len(raw_returns) >= 20:
+            # Use the distribution of returns earned by this *directional* trade.
+            # For a long, per-unit P&L is +r; for a short, per-unit P&L is -r.
+            sign = math.copysign(1.0, ml_signal)
+            pnl_dist = [r * sign for r in raw_returns]
+            f_empirical = busseti_kelly_bisection(
+                returns = pnl_dist,
+                epsilon = self.BUSSETI_EPSILON,
+                w_floor = self.BUSSETI_W_FLOOR,
+                f_max   = self._cfg.MAX_POSITION_FRACTION * 2.0,
+                n_iters = self.BISECTION_ITERS,
+            )
+            f_busseti = min(f_param, f_empirical)
+            method = (
+                f"ParamKelly(μ={mu:.5f}, σ={sigma_bar:.5f}, "
+                f"f_k={f_kelly:.4f}, f_var={f_var_cap:.4f}) "
+                f"∩ Empirical(n={len(raw_returns)}, f={f_empirical:.4f})"
+            )
+        else:
+            f_busseti = f_param
+            method = (
+                f"ParamKelly(μ={mu:.5f}, σ={sigma_bar:.5f}, "
+                f"f_k={f_kelly:.4f}, f_var={f_var_cap:.4f}) "
+                f"[no empirical tail cap — insufficient labelled data]"
+            )
 
         # GRI graduated scaling (Layer 2)
         f_geo  = f_busseti * gri.kelly_multiplier

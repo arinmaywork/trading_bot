@@ -46,10 +46,14 @@ A production-grade, fully asynchronous Python trading system for the Indian Nati
 ## Features
 
 - **Dynamic Universe** — scores 400+ NSE stocks daily, trades the top 50 by liquidity and momentum
-- **ML Ensemble** — XGBoost + Ridge meta-learner predicts 1-min forward returns, retrains every 30 min
+- **ML Ensemble** — XGBoost + Ridge meta-learner predicts 1-min forward returns, retrains every 30 min (5,000-sample rolling window, 7-day Redis TTL)
 - **Gemini Sentiment** — LLM cognitive sentiment from live news headlines (auto-rotates models on quota limits)
 - **Geopolitical Risk** — composite GRI from VIX, USD/INR, and keyword conflict signals
 - **CNC / MIS Hybrid** — high-confidence signals with early entry become CNC (delivery/swing); rest are MIS (intraday)
+- **Parametric Risk-Constrained Kelly** — closed-form `f* = μ/σ²` with Busseti VaR cap `(1−W_floor)/(zσ−μ)`; vol-scaled stops
+- **Vol-Scaled Stops + Time Stop** — HSL/TSL_activation/TSL_callback = `max(config_floor, k·σ_bar)`; 25-min kill for dead trades
+- **Portfolio Loss Budgets (R-13)** — daily −2% / weekly −5% / monthly −8% auto-halt + per-symbol consecutive-loss blacklist
+- **Broker-Balance Auto-Sync (R-14)** — polls `kite.margins()` and resizes active capital to match real Zerodha equity (live mode only)
 - **FIFO P&L Tracking** — per-symbol realized P&L with brokerage and STT costs; accessible via `/pnl`
 - **Headless Startup** — no terminal needed; sends Zerodha login URL to Telegram on startup
 - **Auto Error Forwarding** — any ERROR/CRITICAL log line is forwarded to Telegram automatically
@@ -72,6 +76,8 @@ A production-grade, fully asynchronous Python trading system for the Indian Nati
 | `geopolitical.py` | Macro risk | `GeopoliticalRiskMonitor`, `GPRSnapshot` |
 | `execution.py` | Order management | `OrderExecutor`, `OrderSlicer` |
 | `telegram_controller.py` | Remote control | `TelegramController`, `BotState` |
+| `portfolio_risk.py` | D/W/M loss budgets, blacklist, halts | `PortfolioRiskMonitor`, `RiskBudget` |
+| `position_manager.py` | Exit engine — HSL/TSL/time stops | `PositionManager`, `PositionState` |
 | `telegram_log_handler.py` | Error alerting | `TelegramLogHandler` |
 | `logbook.py` | Trade logging & P&L | `Logbook`, `TradeLogRow`, `get_pnl_report` |
 | `agent_pipeline.py` | LLM pipeline | `AgentPipeline`, `ModelRotator` |
@@ -94,12 +100,42 @@ Alpha_t = ML_Signal × Geopolitical_Multiplier
 ```
 `ML_Signal` is the XGBoost+Ridge meta-learner output ∈ [-1, 1], trained on microstructure, sentiment, and volatility features.
 
-### Busseti Risk-Constrained Kelly
+### Busseti Risk-Constrained Kelly (parametric form)
 ```
-f* = argmax E[log(1 + f·r)]
-     subject to P(Wealth < 95%) ≤ 5%
+σ_bar = σ_annual / √(252 × 375)          # per-minute vol
+μ     = |ml_signal| / SIGNAL_SCALE       # per-bar expected edge
+
+f_kelly  = μ / σ_bar²                    # raw Kelly
+f_varcap = (1 − W_floor) / (z · σ_bar − μ)   # Busseti VaR cap (95% CI)
+
+f_final  = KELLY_FRACTION × min(f_kelly, f_varcap, 2·MAX_POSITION_FRACTION)
 ```
-Solved via bisection on the empirical return distribution stored in Redis.
+The VaR cap enforces `P(Wealth < W_floor) ≤ 5%` with `W_floor = 0.95`, `z = 1.645`.
+An empirical bisection sizer runs as a secondary safety cap. The hard
+`MAX_POSITION_FRACTION` (default 5%) is the final ceiling.
+
+### Vol-Scaled Stops
+```
+HSL  = max(HARD_STOP_LOSS_PCT,   3.0 · σ_bar)
+TSL_act = max(TSL_ACTIVATION_PCT, 2.5 · σ_bar)
+TSL_cb  = max(TSL_CALLBACK_PCT,   1.5 · σ_bar)
+```
+Stops are floored at config values — never looser than the user-chosen
+floor, but wider for volatile names so the bot isn't shaken out of
+trades by normal noise. A 25-minute time stop kills trades that drift
+without making progress.
+
+### Portfolio Loss Budgets (R-13)
+```
+day_limit_inr   = DAILY_LOSS_LIMIT_PCT   · active_capital   # default 2%
+week_limit_inr  = WEEKLY_LOSS_LIMIT_PCT  · active_capital   # default 5%
+month_limit_inr = MONTHLY_LOSS_LIMIT_PCT · active_capital   # default 8%
+```
+FIFO-matched realized P&L (from `logbook.py` daily CSVs) is compared to
+these rupee budgets every `RISK_CHECK_INTERVAL_S` (default 60s).
+Escalation is one-way inside each window: DAY → WEEK → MONTH.
+DAY/WEEK halts auto-lift when the calendar window closes; MONTH halt
+forces `PAPER_MONITOR` mode + manual `/resume`.
 
 ### CNC / MIS Classification
 A signal is classified as **CNC** (delivery) when all conditions hold:
@@ -110,6 +146,54 @@ A signal is classified as **CNC** (delivery) when all conditions hold:
 - Entry time is before `CNC_ENTRY_CUTOFF_HOUR` IST (default 13:00)
 
 All other signals are **MIS** (intraday, squared off by 3:20 PM IST).
+
+---
+
+## Capital Management
+
+The bot has a single source of truth for active trading capital: `BotState.paper_capital`.
+The name is historical — it holds the active capital in both paper and live mode.
+Every change (manual via `/capital`, automatic via broker sync, or seeded from
+`TOTAL_CAPITAL` at startup) fans out to:
+
+- `RiskManager._capital` → used by the parametric Kelly sizer in `strategy.py`
+- `PortfolioRiskMonitor._capital` → re-anchors the daily/weekly/monthly loss budgets
+- `settings.strategy.TOTAL_CAPITAL` → updated where possible so status banners reflect truth
+
+### Manual capital control
+```
+/capital              → show active capital + current loss budgets
+/capital 700000       → set active capital to ₹7,00,000
+```
+Position sizing and D/W/M loss budgets rescale on the next strategy cycle.
+Already-open positions keep their original quantities — only new entries are affected.
+
+### Automatic capital sync from Zerodha (R-14)
+In **live mode only**, set `AUTO_SYNC_CAPITAL=true` in `.env` to have the bot
+poll `kite.margins()` every 5 minutes and resize the active capital to match
+the real broker balance.
+
+```
+active_capital = min(equity.net × SAFETY_BUFFER, AUTO_SYNC_MAX_CAPITAL)
+```
+
+Defaults:
+- `AUTO_SYNC_INTERVAL_S     = 300`    (poll every 5 min)
+- `AUTO_SYNC_SAFETY_BUFFER  = 0.90`   (use 90% of broker balance; 10% headroom for slippage/costs)
+- `AUTO_SYNC_MIN_DELTA_PCT  = 0.01`   (only resize if delta ≥ 1% — prevents churn)
+- `AUTO_SYNC_MAX_CAPITAL    = 1e7`    (hard ceiling at ₹1 crore)
+
+On every successful sync the bot posts a Telegram notification showing the
+raw broker balance, safety buffer, and the new active capital. The
+`PortfolioRiskMonitor` then re-anchors the D/W/M loss budgets on the next
+cycle, so your risk limits always move with your actual account size.
+
+**Manual controls:**
+- `/balance` — show the raw Zerodha equity balance without changing anything
+- `/synccapital` — force an immediate resync (useful after adding/withdrawing funds)
+
+**Paper mode:** Auto-sync is deliberately disabled. Paper capital is whatever
+you set via `/capital` or `TOTAL_CAPITAL` — there is no real broker to poll.
 
 ---
 
@@ -172,9 +256,11 @@ python main.py
 | `FRED_API_KEY` | — | Optional GPR data from FRED |
 | `REDIS_HOST` | — | Default: `localhost` (use `redis` for Docker) |
 | `REDIS_PORT` | — | Default: `6379` |
-| `TOTAL_CAPITAL` | — | INR, default `500000` |
+| `TOTAL_CAPITAL` | — | INR, default `500000` (seed value; may be overridden at runtime) |
 | `PAPER_TRADE` | — | `true` for paper mode, `false` for live |
 | `MIN_TRADE_VALUE` | — | Default `2000` INR |
+| `AUTO_SYNC_CAPITAL` | — | `true` to auto-sync capital from Zerodha balance every 5 min (live mode only) |
+| `AUTO_SYNC_MAX_CAPITAL` | — | Hard ceiling on auto-synced capital (INR). Default `10000000` (₹1 Cr) |
 
 ---
 
@@ -216,7 +302,15 @@ For mid-session token refresh (without restart): use `/login` then `/token`.
 | `/status` | Full pipeline snapshot (GRI, VIX, sentiment, active guards) |
 | `/tasks` | Background task heartbeat status (🟢 < 2 min / 🟡 < 10 min / 🔴 stale) |
 | `/pnl` | Today's P&L statement — MIS + CNC sections with net after brokerage & STT |
-| `/capital <amount>` | Update paper trade capital (INR) |
+| `/risk` | Portfolio loss-budget snapshot (D/W/M + blacklist + active halts) |
+
+### Capital Management
+| Command | Description |
+|---|---|
+| `/capital` | Show current active capital + current D/W/M loss budgets |
+| `/capital <amount>` | Set active capital manually; rescales position sizing + risk budgets |
+| `/balance` | Show Zerodha equity balance (cash, utilised, net) |
+| `/synccapital` | Force immediate capital resync from Zerodha balance |
 
 ### Token Management
 | Command | Description |

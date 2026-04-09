@@ -118,6 +118,18 @@ class BotState:
     # ── Trading guards set via Telegram ──────────────────────────────────
     no_new_buys:    bool         = False   # /nobuy  — block new BUY entries
     no_new_sells:   bool         = False   # /nosell — block new SELL/short entries
+    # ── R-13: Portfolio risk budget state (set by portfolio_risk.py) ────
+    risk_halt_scope:  str        = "NONE"     # NONE | DAY | WEEK | MONTH
+    risk_halt_reason: str        = ""
+    risk_halt_until:  Optional[datetime] = None   # when new entries may resume
+    risk_day_pnl:     float      = 0.0
+    risk_week_pnl:    float      = 0.0
+    risk_month_pnl:   float      = 0.0
+    risk_day_limit:   float      = 0.0        # absolute ₹ limit (cached for /risk)
+    risk_week_limit:  float      = 0.0
+    risk_month_limit: float      = 0.0
+    risk_blacklist:   set        = field(default_factory=set)  # symbols halted today
+    risk_last_check:  str        = ""
     # ── Task health — updated by each background task every cycle ────────
     task_heartbeats: dict        = field(default_factory=dict)
     # { task_name: {"last_beat": float, "cycles": int, "errors": int} }
@@ -159,6 +171,10 @@ class TelegramController:
         self._token_cache_file = Path(__file__).parent / ".kite_token"
         # Logbook reference — populated by main.py via set_logbook()
         self._logbook          = None
+        # PortfolioRiskMonitor reference — set via set_portfolio_risk()
+        self._portfolio_risk   = None
+        # Broker-balance fetcher — awaitable set by main.py via set_margin_fetcher()
+        self._margin_fetcher   = None
         # ModelRotator reference — populated by main.py via set_rotator()
         self._rotator          = None
 
@@ -193,6 +209,20 @@ class TelegramController:
         Call once from main.py: tg_controller.set_rotator(_rotator)
         """
         self._rotator = rotator
+
+    def set_portfolio_risk(self, monitor: Any) -> None:
+        """
+        Register the PortfolioRiskMonitor so /risk can pull a fresh budget.
+        Call once from main.py.
+        """
+        self._portfolio_risk = monitor
+
+    def set_margin_fetcher(self, fetcher) -> None:
+        """
+        Register an async callable that returns Zerodha's margin dict
+        (kite.margins() schema). Used by /synccapital and /balance.
+        """
+        self._margin_fetcher = fetcher
 
     def _save_token_cache(self, token: str) -> None:
         try:
@@ -357,7 +387,10 @@ class TelegramController:
                 f"{'─' * 28}\n"
                 "📊 <b>P&amp;L &amp; Capital</b>\n"
                 "/pnl — Today's P&amp;L statement (MIS + CNC)\n"
-                "/capital &lt;amount&gt; — Update paper trade capital\n"
+                "/risk — Portfolio loss-budget (D/W/M + blacklist)\n"
+                "/balance — Show Zerodha equity balance\n"
+                "/synccapital — Resync capital from Zerodha balance\n"
+                "/capital &lt;amount&gt; — Set capital manually (shows budgets)\n"
                 f"{'─' * 28}\n"
                 "🔑 <b>Daily Token Refresh (no restart needed)</b>\n"
                 "/login — Get today's Zerodha login URL\n"
@@ -380,8 +413,21 @@ class TelegramController:
             await self.send("⏸ <b>Trading paused.</b> Monitoring continues. Send /resume to restart.")
 
         elif cmd == "/resume":
+            # R-13: also clear any active risk halt on manual resume
+            prev_scope = self._state.risk_halt_scope
             self._state.paused = False
-            await self.send("▶️ <b>Trading resumed.</b>")
+            self._state.risk_halt_scope  = "NONE"
+            self._state.risk_halt_reason = ""
+            self._state.risk_halt_until  = None
+            self._state.no_new_buys      = False
+            self._state.no_new_sells     = False
+            if self._state.mode == TradingMode.PAPER_MONITOR and prev_scope == "MONTH":
+                self._state.mode = TradingMode.GRI_ONLY
+            extra = ""
+            if prev_scope and prev_scope != "NONE":
+                extra = f"\n🔓 Risk halt cleared: <code>{prev_scope}</code>"
+                logger.warning("Manual /resume — cleared risk halt scope=%s", prev_scope)
+            await self.send(f"▶️ <b>Trading resumed.</b>{extra}")
 
         elif cmd == "/login":
             if self._kite is None:
@@ -536,29 +582,169 @@ class TelegramController:
                     await self.send(f"❌ Could not generate P&L report: <code>{exc}</code>")
 
         elif cmd == "/capital":
-            # ── Update paper trade capital ────────────────────────────────
+            # ── Update active trading capital (paper OR live) ─────────────
             parts = text.strip().split(None, 1)
             raw   = parts[1].strip() if len(parts) > 1 else ""
-            # Strip currency symbols and commas (e.g. "₹5,00,000" → "500000")
-            raw = raw.replace("₹", "").replace(",", "").strip()
+            # If called without an argument, just report the current value.
+            if not raw:
+                try:
+                    from portfolio_risk import settings as _s
+                    _day_lim  = _s.strategy.DAILY_LOSS_LIMIT_PCT   * self._state.paper_capital
+                    _week_lim = _s.strategy.WEEKLY_LOSS_LIMIT_PCT  * self._state.paper_capital
+                    _mon_lim  = _s.strategy.MONTHLY_LOSS_LIMIT_PCT * self._state.paper_capital
+                    await self.send(
+                        f"💰 <b>Active capital</b>\n"
+                        f"{'─' * 28}\n"
+                        f"Current: <b>₹{self._state.paper_capital:,.2f}</b>\n"
+                        f"Day limit:   −₹{_day_lim:,.0f}\n"
+                        f"Week limit:  −₹{_week_lim:,.0f}\n"
+                        f"Month limit: −₹{_mon_lim:,.0f}\n\n"
+                        f"To change: <code>/capital &lt;amount&gt;</code>"
+                    )
+                except Exception as exc:
+                    await self.send(
+                        f"💰 Current capital: <b>₹{self._state.paper_capital:,.2f}</b>\n"
+                        f"To change: <code>/capital &lt;amount&gt;</code>"
+                    )
+            else:
+                # Strip currency symbols and commas (e.g. "₹5,00,000" → "500000")
+                raw = raw.replace("₹", "").replace(",", "").strip()
+                try:
+                    new_capital = float(raw)
+                    if new_capital <= 0:
+                        raise ValueError("Capital must be positive")
+                    old_capital = self._state.paper_capital
+                    self._state.paper_capital = new_capital
+                    # Compute new loss budgets so the user can sanity-check
+                    try:
+                        from portfolio_risk import settings as _s
+                        _day_lim  = _s.strategy.DAILY_LOSS_LIMIT_PCT   * new_capital
+                        _week_lim = _s.strategy.WEEKLY_LOSS_LIMIT_PCT  * new_capital
+                        _mon_lim  = _s.strategy.MONTHLY_LOSS_LIMIT_PCT * new_capital
+                        budget_block = (
+                            f"\n📐 <b>New loss budgets</b>\n"
+                            f"Day:   −₹{_day_lim:,.0f}\n"
+                            f"Week:  −₹{_week_lim:,.0f}\n"
+                            f"Month: −₹{_mon_lim:,.0f}\n"
+                        )
+                    except Exception:
+                        budget_block = ""
+                    await self.send(
+                        f"✅ <b>Active capital updated</b>\n"
+                        f"{'─' * 28}\n"
+                        f"Old: ₹{old_capital:,.2f}\n"
+                        f"New: <b>₹{new_capital:,.2f}</b>\n"
+                        f"{budget_block}\n"
+                        f"Takes effect on next strategy cycle. "
+                        f"Position sizing, Kelly fraction, and D/W/M loss "
+                        f"budgets all rescale automatically."
+                    )
+                    logger.warning(
+                        "Active capital updated to ₹%.2f via Telegram (was ₹%.2f).",
+                        new_capital, old_capital,
+                    )
+                except (ValueError, IndexError):
+                    await self.send(
+                        "⚠️ Usage: <code>/capital &lt;amount&gt;</code>\n"
+                        "Example: <code>/capital 700000</code>\n"
+                        "Strips ₹ and commas automatically.\n"
+                        "Call without an argument to see current value."
+                    )
+
+        elif cmd == "/balance":
+            # ── R-14: Show raw Zerodha broker balance ────────────────────
+            if self._margin_fetcher is None:
+                await self.send(
+                    "⚠️ Broker fetcher not wired. "
+                    "Available only in live mode after startup."
+                )
+            else:
+                try:
+                    margins = await self._margin_fetcher()
+                    equity  = (margins or {}).get("equity", {}) or {}
+                    avail   = equity.get("available", {}) or {}
+                    used    = equity.get("utilised", {}) or {}
+                    net     = float(equity.get("net") or avail.get("live_balance") or 0)
+                    cash    = float(avail.get("cash") or 0)
+                    opening = float(avail.get("opening_balance") or 0)
+                    debits  = float(used.get("debits") or 0)
+                    await self.send(
+                        f"🏦 <b>Zerodha equity balance</b>\n"
+                        f"{'─' * 28}\n"
+                        f"Opening:    ₹{opening:,.2f}\n"
+                        f"Cash:       ₹{cash:,.2f}\n"
+                        f"Utilised:   ₹{debits:,.2f}\n"
+                        f"Net:        <b>₹{net:,.2f}</b>\n\n"
+                        f"Active bot capital: ₹{self._state.paper_capital:,.2f}"
+                    )
+                except Exception as exc:
+                    logger.error("/balance failed: %s", exc, exc_info=True)
+                    await self.send(f"❌ Broker fetch failed: <code>{exc}</code>")
+
+        elif cmd == "/synccapital":
+            # ── R-14: Force immediate capital sync from broker ───────────
+            if self._margin_fetcher is None:
+                await self.send(
+                    "⚠️ Broker fetcher not wired. "
+                    "Auto-sync is only available in live mode."
+                )
+            else:
+                try:
+                    from portfolio_risk import settings as _s
+                    margins = await self._margin_fetcher()
+                    equity  = (margins or {}).get("equity", {}) or {}
+                    avail   = equity.get("available", {}) or {}
+                    raw_bal = float(
+                        equity.get("net")
+                        or avail.get("live_balance")
+                        or avail.get("cash")
+                        or 0
+                    )
+                    if raw_bal <= 0:
+                        await self.send(
+                            "⚠️ Broker reported zero balance — nothing to sync. "
+                            "Check Zerodha login / funds."
+                        )
+                    else:
+                        buffer  = float(getattr(_s.strategy, "AUTO_SYNC_SAFETY_BUFFER", 0.90))
+                        ceiling = float(getattr(_s.strategy, "AUTO_SYNC_MAX_CAPITAL", 1e7))
+                        new_cap = min(raw_bal * buffer, ceiling)
+                        old_cap = self._state.paper_capital
+                        self._state.paper_capital = new_cap
+                        await self.send(
+                            f"🔄 <b>Manual capital sync from Zerodha</b>\n"
+                            f"{'─' * 28}\n"
+                            f"Broker balance: ₹{raw_bal:,.2f}\n"
+                            f"Safety buffer:  {buffer:.0%}\n"
+                            f"Ceiling:        ₹{ceiling:,.0f}\n"
+                            f"─────────────\n"
+                            f"Old capital: ₹{old_cap:,.2f}\n"
+                            f"New capital: <b>₹{new_cap:,.2f}</b>\n\n"
+                            f"Position sizing + D/W/M loss budgets "
+                            f"rescale on the next strategy cycle."
+                        )
+                        logger.warning(
+                            "Manual capital sync: raw=₹%.2f × %.2f → ₹%.2f (was ₹%.2f)",
+                            raw_bal, buffer, new_cap, old_cap,
+                        )
+                except Exception as exc:
+                    logger.error("/synccapital failed: %s", exc, exc_info=True)
+                    await self.send(f"❌ Sync failed: <code>{exc}</code>")
+
+        elif cmd == "/risk":
+            # ── R-13: Portfolio loss-budget report ───────────────────────
             try:
-                new_capital = float(raw)
-                if new_capital <= 0:
-                    raise ValueError("Capital must be positive")
-                self._state.paper_capital = new_capital
-                await self.send(
-                    f"✅ <b>Paper capital updated</b>\n"
-                    f"New capital: <b>₹{new_capital:,.2f}</b>\n"
-                    f"This takes effect on the next strategy cycle.\n"
-                    f"(Live mode capital is set via TOTAL_CAPITAL env var.)"
-                )
-                logger.info("Paper capital updated to ₹%.2f via Telegram.", new_capital)
-            except (ValueError, IndexError):
-                await self.send(
-                    "⚠️ Usage: <code>/capital &lt;amount&gt;</code>\n"
-                    "Example: <code>/capital 500000</code>\n"
-                    "Strips ₹ and commas automatically."
-                )
+                from portfolio_risk import format_risk_report
+                if self._portfolio_risk is not None:
+                    try:
+                        self._portfolio_risk.check(self._state)
+                    except Exception as exc:
+                        logger.warning("/risk: monitor.check failed: %s", exc)
+                report = format_risk_report(self._state)
+                await self.send(report)
+            except Exception as exc:
+                logger.error("/risk error: %s", exc, exc_info=True)
+                await self.send(f"❌ Could not render risk report: <code>{exc}</code>")
 
         elif cmd == "/resetquota":
             # ── Gemini quota emergency reset ─────────────────────────────────
