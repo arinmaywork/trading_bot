@@ -141,18 +141,29 @@ class ModelRotator:
     #   gemini-1.5-flash     — deprecated (returns 404)
     #   gemini-1.5-pro       — deprecated (returns 404)
     #
-    # Current free-tier models (April 2026):
-    #   gemini-2.5-flash      → 10 RPM, 250 RPD  (primary quality model)
-    #   gemini-2.5-flash-lite → 15 RPM, 1000 RPD (high-volume fallback)
-    #   gemini-2.5-pro        → 5 RPM,  100 RPD  (reserved for risk manager)
+    # Current free-tier models (April 2026) — FIX B-17:
+    #   ACTUAL project limits (read from Google AI Studio Rate Limit dashboard,
+    #   NOT the documented defaults which apply only to paid/billing-enabled tiers).
+    #
+    #   gemini-2.5-flash      → 5 RPM,  20 RPD   (primary quality model)
+    #   gemini-2.5-flash-lite → 15 RPM, 20 RPD   (high-volume fallback — same RPD cap on free tier)
+    #   gemini-2.5-pro        → 5 RPM,  20 RPD   (reserved for risk manager)
+    #
+    # NOTE: If you set up billing, update these values to reflect the raised limits
+    # shown in the Google AI Studio dashboard. The rpd_limit here is deliberately
+    # set to 18 (not 20) to leave a 2-call safety margin and avoid hitting the wall.
     _POOL: List[_ModelSlot] = [
-        _ModelSlot("gemini-2.5-flash",      "2.5 Flash",      quality=4, rpm_limit=10, rpd_limit=250,  tier="flash"),
-        _ModelSlot("gemini-2.5-flash-lite",  "2.5 Flash-Lite", quality=3, rpm_limit=15, rpd_limit=1000, tier="flash"),
-        _ModelSlot("gemini-2.5-pro",         "2.5 Pro",        quality=5, rpm_limit=5,  rpd_limit=100,  tier="pro"),
+        _ModelSlot("gemini-2.5-flash",      "2.5 Flash",      quality=4, rpm_limit=5,  rpd_limit=18, tier="flash"),
+        _ModelSlot("gemini-2.5-flash-lite",  "2.5 Flash-Lite", quality=3, rpm_limit=15, rpd_limit=18, tier="flash"),
+        _ModelSlot("gemini-2.5-pro",         "2.5 Pro",        quality=5, rpm_limit=5,  rpd_limit=18, tier="pro"),
     ]
 
     # Cooldowns: separate RPM vs RPD exhaustion
-    _RPM_COOLDOWN_S  = 65     # just over 1 minute — enough for RPM window to reset
+    # FIX B-17: RPM cooldown is exactly 65s (just over Google's 60s window).
+    # Do NOT use exponential backoff for RPM hits — the window resets in 60s so
+    # any cooldown > 65s wastes quota budget by blocking an already-reset window.
+    # Exponential backoff is used ONLY for RPD exhaustion (handled separately).
+    _RPM_COOLDOWN_S  = 65     # just over 1 minute — matches Google's RPM reset window
     _RPD_COOLDOWN_S  = 86400  # 24 hours — daily quota exhausted
 
     # Warn when a model has used this fraction of its daily quota
@@ -381,7 +392,15 @@ class ModelRotator:
         """
         Apply cooldown after a 429.
         is_daily=True  → daily quota exhausted (24h cooldown).
-        is_daily=False → RPM hit (65s + exponential back-off).
+        is_daily=False → RPM hit: FLAT 65s cooldown (NOT exponential back-off).
+
+        FIX B-17: RPM hits must use a flat cooldown, not exponential back-off.
+        Reason: Google's RPM window resets every 60 seconds. Any cooldown > 65s
+        wastes quota budget by blocking the model after the window has already reset.
+        Exponential back-off made sense when rpd_limit was 250 (many retries needed),
+        but with rpd_limit=18, we want to use every available slot efficiently.
+        The exponential back-off was the direct cause of the "4800s cooldown" seen
+        in logs from April 2 (65s * 2^6 = 4160s, or 300s * 2^4 = 4800s in older code).
         """
         slot.errors_429 += 1
         if is_daily:
@@ -390,10 +409,15 @@ class ModelRotator:
                 "ModelRotator: %s daily quota exhausted — disabling for 24h.", slot.display
             )
         else:
-            # Exponential back-off capped at 10 min for RPM errors
-            cooldown = min(self._RPM_COOLDOWN_S * (2 ** min(slot.errors_429 - 1, 3)), 600)
+            # FIX B-17: Flat 65s cooldown for RPM hits — NOT exponential.
+            # Google's RPM window resets in 60s, so waiting 65s is sufficient.
+            # Repeated RPM hits just mean we're at the edge of the window; the
+            # solution is proactive RPD budget management (fewer calls per day),
+            # not longer cooldowns that hurt all subsequent call attempts.
+            cooldown = self._RPM_COOLDOWN_S   # always 65s, regardless of error count
             logger.warning(
-                "ModelRotator: %s RPM limit hit — cooldown %.0fs (error #%d).",
+                "ModelRotator: %s RPM limit hit — flat cooldown %.0fs (error #%d). "
+                "Consider reducing call frequency if this repeats.",
                 slot.display, cooldown, slot.errors_429,
             )
         slot.cooldown_until = time.time() + cooldown
@@ -413,20 +437,34 @@ class ModelRotator:
     def recommended_interval_s(self, gri_composite: float = 0.3, vix: float = 18.0) -> int:
         """
         Recommended sleep between sentiment cycles.
-        NSE day = 375 min. At 360s base → ~62 Flash calls/day — well within 1500 RPD.
-        Pro models are called at most ~10x/day (only during high-risk windows).
+
+        FIX B-17: Recalibrated for actual free-tier limits (18 RPD budget across 3 models).
+        NSE market day = 375 minutes (09:15 – 15:30 IST).
+        With 18 calls/day budget: 375 min / 18 calls = ~20.8 min/call → 1250s minimum.
+        We use tiered intervals, reserving extra calls for high-risk windows.
+
+        Budget allocation (18 calls/day on primary Flash model):
+          Opening (30 min)   → 1 call  (1250s interval, but window is short)
+          Pre-close (30 min) → 1 call
+          EXTREME GRI        → 2 calls (600s × 2 = 20 min)
+          HIGH GRI           → 3 calls (900s × 3 = 45 min)
+          ELEVATED (default) → 8 calls (1200s intervals)
+          Remaining          → 3 calls buffer
+
+        Previous intervals (180s–600s) assumed 250 RPD. With 18 RPD, those intervals
+        would exhaust the daily budget in 54 minutes at EXTREME (18 × 180s / 60 = 54min).
         """
         now  = time.time()
         ist  = datetime.fromtimestamp(now, tz=_IST)
         hour = ist.hour + ist.minute / 60.0
 
-        if 9.25 <= hour <= 9.75:   return 180   # Opening window
-        if 15.0 <= hour <= 15.5:   return 180   # Pre-close window
-        if gri_composite >= 0.65:  return 180   # EXTREME risk
-        if gri_composite >= 0.50:  return 240   # HIGH risk
-        if gri_composite >= 0.30:  return 360   # ELEVATED (default)
-        if gri_composite >= 0.15:  return 480   # MODERATE
-        return 600                              # LOW — conserve budget
+        if 9.25 <= hour <= 9.75:   return 900    # Opening  — 1 call per 15min window
+        if 15.0 <= hour <= 15.5:   return 900    # Pre-close — 1 call per 15min window
+        if gri_composite >= 0.65:  return 600    # EXTREME risk — 1 call per 10 min
+        if gri_composite >= 0.50:  return 900    # HIGH risk    — 1 call per 15 min
+        if gri_composite >= 0.30:  return 1200   # ELEVATED (default) — 1 call per 20 min
+        if gri_composite >= 0.15:  return 1500   # MODERATE    — 1 call per 25 min
+        return 1800                             # LOW — conserve budget (1 call per 30 min)
 
     def can_afford_risk_manager(self) -> bool:
         """
@@ -706,17 +744,24 @@ async def _call_gemini_with_rotation(
                 # Treating RPM hits as daily would give Flash models a 24h ban
                 # from a simple per-minute rate limit, permanently disabling them.
                 err_lower = err_msg.lower()
+                # FIX B-17: Tightened is_daily detection to avoid false-positive 24h bans.
+                #
+                # REMOVED: "limit: 0" / "limit: 0.0" checks.
+                # REASON: These strings appear in Google errors for zero-quota TOOL/GROUNDING
+                # features (Search grounding, Map grounding, etc. which have 0 free RPD),
+                # NOT for the generative model quota itself. Matching on them incorrectly
+                # applied a 24-hour ban to perfectly healthy generative models.
+                # Example: a response mentioning "generate_requests_per_day limit: 0" for
+                # a grounding tool would ban the Flash model for 24h even though its own
+                # generative quota was untouched.
+                #
+                # KEPT: per_day / daily — these appear exclusively in generative RPD errors.
+                # Google's canonical daily quota message contains "generate_requests_per_day".
                 is_daily = (
-                    "per_day"       in err_lower    # Google standard RPD phrase
-                    or "daily"      in err_lower    # generic / older SDK phrasing
-                    or "limit: 0"   in err_msg      # free-tier: zero quota allocated
-                    or "limit: 0.0" in err_msg
-                    # NOTE: removed 'calls_made == 0' and 'errors_429 >= 3' heuristics.
-                    # These caused a dangerous cascade: when fresh models (calls_made=0)
-                    # get ANY error on their first call, they would all be marked as
-                    # daily-exhausted and banned for 24 hours — even if the error was
-                    # a transient network issue, a model deprecation 404 (handled
-                    # separately), or a project-level RPM limit (which resets in 65s).
+                    "per_day"  in err_lower    # Google standard: "generate_requests_per_day"
+                    or "daily" in err_lower    # older SDK / generic phrasing
+                    # NOTE: Do NOT add "limit: 0" here — see explanation above.
+                    # NOTE: Do NOT add calls_made==0 or errors_429>=N heuristics.
                     # Trust only the explicit error message content for daily classification.
                 )
                 _rotator.mark_rate_limited(slot, is_daily=is_daily)

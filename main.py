@@ -955,12 +955,27 @@ async def strategy_loop(
                 actionable_count, len(active_symbols),
             )
             if sentiment.sentiment_score == 0.0:
-                logger.warning("Sentiment=0.0 — Gemini quota exhausted.")
-                if not _quota_notified:
-                    _quota_notified = True
-                    asyncio.create_task(telegram.notify_quota_exhausted(
-                        mode=bot_state.mode.value if bot_state else "unknown"
-                    ), name="tg_quota")
+                # FIX B-17: distinguish actual quota exhaustion from other errors.
+                # sentiment_score==0.0 fires for ANY failure (network, parse, quota).
+                # Only call it a quota problem when the ModelRotator confirms all slots
+                # are on cooldown — otherwise log a more accurate message.
+                from agent_pipeline import _rotator as _gm_rotator  # noqa: PLC0415
+                if _gm_rotator.all_on_cooldown():
+                    logger.warning(
+                        "Sentiment=0.0 — Gemini quota exhausted (all models on cooldown, "
+                        "soonest in %.0fs). Check Google AI Studio dashboard for quota usage.",
+                        _gm_rotator.soonest_available_in(),
+                    )
+                    if not _quota_notified:
+                        _quota_notified = True
+                        asyncio.create_task(telegram.notify_quota_exhausted(
+                            mode=bot_state.mode.value if bot_state else "unknown"
+                        ), name="tg_quota")
+                else:
+                    logger.warning(
+                        "Sentiment=0.0 — Gemini call failed (non-quota issue: "
+                        "network/parse error or stale result). Bot will retry next cycle."
+                    )
 
         if bot_state:
             bot_state.update(
