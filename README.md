@@ -195,6 +195,35 @@ cycle, so your risk limits always move with your actual account size.
 **Paper mode:** Auto-sync is deliberately disabled. Paper capital is whatever
 you set via `/capital` or `TOTAL_CAPITAL` — there is no real broker to poll.
 
+### Paper ↔ Live toggle (R-15)
+
+The `PAPER_TRADE` env var sets the mode at startup, but you can flip it
+at runtime over Telegram without restarting the bot:
+
+| Command | Effect |
+|---|---|
+| `/tradingmode` | Show current mode (PAPER or LIVE) |
+| `/papermode` | Switch to PAPER immediately — always safe |
+| `/livemode` | Arm a 60-second LIVE confirmation window |
+| `/livemode CONFIRM` | Confirm the switch to LIVE within the window |
+
+The two-step confirmation for `/livemode` is intentional — switching to
+live mode means real money is at risk, and a fat-fingered command is
+the last thing you want there. The bot waits for an explicit
+`/livemode CONFIRM` within 60 seconds; if you don't send it in time,
+the arm expires and nothing changes.
+
+Already-open positions are **never** touched by a mode switch — only
+future entries are affected. If you switch from LIVE back to PAPER
+while holding real Zerodha positions, those positions remain real; the
+bot just won't place any new real orders until you run `/livemode`
+again.
+
+The override is in-memory only. A restart reverts to whatever
+`PAPER_TRADE` is in your `.env`. This is deliberate: if the bot crashes
+while in LIVE, you don't want it silently coming back up live when
+you expected paper.
+
 ---
 
 ## Setup
@@ -288,13 +317,16 @@ For mid-session token refresh (without restart): use `/login` then `/token`.
 | Command | Description |
 |---|---|
 | `/pause` | Pause order execution (monitoring continues) |
-| `/resume` | Resume order execution |
+| `/resume` | Resume order execution (also clears any risk halt) |
 | `/stop` | Graceful shutdown |
 | `/nobuy` | Block all new BUY entries |
 | `/okbuy` | Re-enable BUY entries |
 | `/nosell` | Block all new SELL/short entries |
 | `/oksell` | Re-enable SELL entries |
-| `/mode` | Switch trading mode (FULL / GRI_ONLY / PAPER_MONITOR) |
+| `/mode` | Switch analysis mode (FULL / GRI_ONLY / PAPER_MONITOR) |
+| `/tradingmode` | Show current PAPER vs LIVE state |
+| `/papermode` | Switch to PAPER (simulated fills, always safe) |
+| `/livemode` | Arm LIVE mode (requires `/livemode CONFIRM` within 60s) |
 
 ### Monitoring
 | Command | Description |

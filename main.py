@@ -61,7 +61,7 @@ from logbook import Logbook
 from telegram_controller import TelegramController, BotState, TradingMode
 from telegram_log_handler import TelegramLogHandler
 from agent_pipeline import AgentPipeline
-from config import settings
+from config import settings, is_paper_trade, set_paper_trade_override
 from data_ingestion import AsyncKiteTickerWrapper, CandleAggregator
 from execution import OrderExecutor, TelegramNotifier
 from rate_limiter import RateLimiter
@@ -589,7 +589,7 @@ async def strategy_loop(
         # Only in LIVE mode, only if enabled, and throttled by
         # AUTO_SYNC_INTERVAL_S. Safety buffer keeps some margin headroom.
         if (
-            not settings.kite.PAPER_TRADE
+            not is_paper_trade()
             and getattr(settings.strategy, "AUTO_SYNC_CAPITAL", False)
             and bot_state is not None
         ):
@@ -836,7 +836,7 @@ async def strategy_loop(
         # in-memory from simulated fills.  Calling kite.positions() in paper
         # mode would return real account positions (from manual trades), which
         # could wrongly trigger the 3:15 PM square-off with real orders.
-        if not settings.kite.PAPER_TRADE:
+        if not is_paper_trade():
             try:
                 async with rate_limiter.request_slot():
                     pos_data = await loop.run_in_executor(None, kite.positions)
@@ -925,7 +925,7 @@ async def strategy_loop(
                 and _ist_now.minute >= settings.strategy.SQUARE_OFF_MINUTE_IST
             )
         )
-        if _past_squareoff and not settings.kite.PAPER_TRADE:
+        if _past_squareoff and not is_paper_trade():
             open_to_close = {s: q for s, q in _open_positions.items() if q != 0}
             if open_to_close and not getattr(_strategy_loop_state, "squareoff_done_today", False):
                 logger.warning(
@@ -995,7 +995,7 @@ async def strategy_loop(
                         )
                 _strategy_loop_state.squareoff_done_today = True
 
-        elif _past_squareoff and settings.kite.PAPER_TRADE:
+        elif _past_squareoff and is_paper_trade():
             # Paper mode: simulate square-off — clear in-memory positions and notify
             open_to_close = {s: q for s, q in _open_positions.items() if q != 0}
             if open_to_close and not getattr(_strategy_loop_state, "squareoff_done_today", False):
@@ -1127,7 +1127,7 @@ async def strategy_loop(
                         # In paper mode, track simulated positions in-memory so
                         # the position guard works correctly between cycles.
                         # (Real mode tracks via kite.positions() API call above.)
-                        if settings.kite.PAPER_TRADE:
+                        if is_paper_trade():
                             delta = report.total_quantity if sig.direction == TradeDirection.BUY else -report.total_quantity
                             _open_positions[symbol] = _open_positions.get(symbol, 0) + delta
                             if _open_positions[symbol] == 0:
@@ -1135,7 +1135,7 @@ async def strategy_loop(
 
                     # B-04 FIX: log_trade() was never called — trades CSV was always empty
                     if logbook:
-                        trade_mode = "PAPER" if settings.kite.PAPER_TRADE else "LIVE"
+                        trade_mode = "PAPER" if is_paper_trade() else "LIVE"
                         await logbook.log_trade(report, sig, trade_mode)
                     if bot_state:
                         bot_state.trades_today += 1

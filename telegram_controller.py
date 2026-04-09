@@ -130,6 +130,8 @@ class BotState:
     risk_month_limit: float      = 0.0
     risk_blacklist:   set        = field(default_factory=set)  # symbols halted today
     risk_last_check:  str        = ""
+    # ── R-15: Runtime paper-trade toggle arming (60-sec confirm window) ──
+    live_mode_arm_until: Optional[datetime] = None
     # ── Task health — updated by each background task every cycle ────────
     task_heartbeats: dict        = field(default_factory=dict)
     # { task_name: {"last_beat": float, "cycles": int, "errors": int} }
@@ -313,6 +315,11 @@ class TelegramController:
             TradingMode.PAPER_MONITOR: "👁 Monitor Only",
         }
         paused_str = "⏸ PAUSED" if s.paused else "▶️ RUNNING"
+        try:
+            from config import is_paper_trade as _ipt
+            trade_mode_str = "📝 PAPER (simulated)" if _ipt() else "💸 LIVE (real money)"
+        except Exception:
+            trade_mode_str = "?"
         gri_emoji  = "🟢" if s.last_gri < 0.30 else ("🟡" if s.last_gri < 0.50 else "🔴")
         sent_emoji = {"Fear": "😨", "Excitement": "🚀", "Neutral": "😐"}.get(
             s.last_sentiment_class, "😐"
@@ -338,6 +345,7 @@ class TelegramController:
             f"⏱ <b>Uptime:</b>      {hours}h {mins}m\n"
             f"{'─' * 34}\n"
             f"⚙️ <b>Mode:</b>        {mode_labels[s.mode]}\n"
+            f"💹 <b>Trading:</b>     {trade_mode_str}\n"
             f"🎮 <b>State:</b>       {paused_str}\n"
             f"🔢 <b>Universe:</b>    {s.active_symbols} symbols\n"
             f"🏆 <b>Top 3:</b>       {top}\n"
@@ -369,7 +377,10 @@ class TelegramController:
             await self.send(
                 f"🤖 <b>SentiStack V2 Commands</b>\n"
                 f"{'─' * 28}\n"
-                "/mode — Change trading mode\n"
+                "/mode — Change trading mode (FULL / GRI_ONLY / MONITOR)\n"
+                "/tradingmode — Show PAPER vs LIVE\n"
+                "/papermode — Switch to PAPER (simulated fills)\n"
+                "/livemode — Arm LIVE mode (requires /livemode CONFIRM)\n"
                 "/status — Full pipeline status\n"
                 "/pause — Pause order execution\n"
                 "/resume — Resume order execution\n"
@@ -404,6 +415,107 @@ class TelegramController:
 
         elif cmd == "/mode":
             await self.send_mode_selector()
+
+        elif cmd == "/tradingmode":
+            # R-15: Show current paper/live status
+            from config import is_paper_trade as _ipt
+            mode_str = "📝 <b>PAPER</b> (simulated fills)" if _ipt() \
+                else "💸 <b>LIVE</b> (real money on Zerodha)"
+            await self.send(
+                f"🔄 <b>Current trading mode</b>\n"
+                f"{'─' * 28}\n"
+                f"{mode_str}\n\n"
+                f"Switch: <code>/papermode</code> or <code>/livemode</code>"
+            )
+
+        elif cmd == "/papermode":
+            # R-15: Force paper trade (always safe — simulates fills, no real orders)
+            try:
+                from config import set_paper_trade_override, is_paper_trade as _ipt
+                if _ipt():
+                    await self.send(
+                        "ℹ️ Already in <b>PAPER</b> mode. "
+                        "No change."
+                    )
+                else:
+                    set_paper_trade_override(True)
+                    self._state.live_mode_arm_until = None
+                    await self.send(
+                        "📝 <b>Switched to PAPER mode</b>\n"
+                        f"{'─' * 28}\n"
+                        "All new orders will be simulated with realistic slippage. "
+                        "No real trades will hit Zerodha.\n\n"
+                        "Already-open real positions are NOT touched — only "
+                        "new entries. Use <code>/tradingmode</code> to confirm."
+                    )
+                    logger.warning("R-15 Paper mode forced via Telegram.")
+            except Exception as exc:
+                logger.error("/papermode failed: %s", exc, exc_info=True)
+                await self.send(f"❌ Mode switch failed: <code>{exc}</code>")
+
+        elif cmd == "/livemode":
+            # R-15: Arm / confirm live-mode switch (two-step for safety)
+            try:
+                from config import set_paper_trade_override, is_paper_trade as _ipt
+                parts = text.strip().split(None, 1)
+                arg   = parts[1].strip().upper() if len(parts) > 1 else ""
+
+                if not _ipt() and arg != "CONFIRM":
+                    await self.send(
+                        "ℹ️ Already in <b>LIVE</b> mode. No change.\n"
+                        "Switch back with <code>/papermode</code>."
+                    )
+                elif arg == "CONFIRM":
+                    # Confirmation attempt — must be within the arm window
+                    now = _ist_now()
+                    armed_until = self._state.live_mode_arm_until
+                    if armed_until is None or now > armed_until:
+                        self._state.live_mode_arm_until = None
+                        await self.send(
+                            "⏱ <b>Live-mode arm expired or not started.</b>\n"
+                            "Send <code>/livemode</code> first, then "
+                            "<code>/livemode CONFIRM</code> within 60 seconds."
+                        )
+                    else:
+                        set_paper_trade_override(False)
+                        self._state.live_mode_arm_until = None
+                        await self.send(
+                            "💸 <b>SWITCHED TO LIVE MODE</b>\n"
+                            f"{'─' * 28}\n"
+                            "⚠️ Real orders will now be sent to Zerodha.\n"
+                            "⚠️ Real money is at risk.\n\n"
+                            "Safeguards still active:\n"
+                            "• R-13 portfolio loss budgets (D/W/M)\n"
+                            "• Consecutive-loss blacklist\n"
+                            "• Vol-scaled stops + time stop\n"
+                            "• /pause, /nobuy, /nosell guards\n\n"
+                            "Revert with <code>/papermode</code> at any time."
+                        )
+                        logger.critical(
+                            "R-15 LIVE MODE ENABLED via Telegram — real orders "
+                            "will now be sent to Zerodha."
+                        )
+                else:
+                    # First step — arm the confirmation window
+                    arm_until = _ist_now() + timedelta(seconds=60)
+                    self._state.live_mode_arm_until = arm_until
+                    await self.send(
+                        "⚠️ <b>Arming LIVE mode — confirmation required</b>\n"
+                        f"{'─' * 28}\n"
+                        "This will switch the bot from PAPER (simulated) to "
+                        "<b>LIVE</b> (real money on Zerodha).\n\n"
+                        "✅ Before confirming, check:\n"
+                        "• Zerodha token is valid (<code>/status</code>)\n"
+                        "• Capital is correct (<code>/capital</code>)\n"
+                        "• Loss budgets look sane (<code>/risk</code>)\n"
+                        "• Broker balance is as expected (<code>/balance</code>)\n\n"
+                        "🔐 To confirm, send within 60 seconds:\n"
+                        "<code>/livemode CONFIRM</code>"
+                    )
+                    logger.warning("R-15 Live mode armed — awaiting /livemode CONFIRM.")
+            except Exception as exc:
+                logger.error("/livemode failed: %s", exc, exc_info=True)
+                await self.send(f"❌ Mode switch failed: <code>{exc}</code>")
 
         elif cmd == "/status":
             await self.send(self._status_text())

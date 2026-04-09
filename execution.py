@@ -28,7 +28,7 @@ import aiohttp
 from kiteconnect import KiteConnect
 from kiteconnect import exceptions as KiteExceptions
 
-from config import settings
+from config import settings, is_paper_trade
 from logbook import Logbook
 from rate_limiter import RateLimiter
 from strategy import SignalState, TradeDirection
@@ -603,7 +603,7 @@ class OrderExecutor:
 
             # ---- Paper trade mode: simulate fill without hitting Zerodha ----
             place_err: Optional[str] = None
-            if settings.kite.PAPER_TRADE:
+            if is_paper_trade():
                 simulated_id = f"PAPER-{signal.symbol}-{idx}-{int(time.time())}"
                 # Realistic slippage: ±0.10% based on direction.
                 # BUY  orders fill slightly above signal price (market lift).

@@ -13,7 +13,7 @@ V2 additions:
 
 import os
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 
 def _require(key: str) -> str:
@@ -374,3 +374,38 @@ class Settings:
 
 
 settings = Settings()
+
+
+# ---------------------------------------------------------------------------
+# R-15: Runtime paper-trade toggle
+# ---------------------------------------------------------------------------
+# `settings.kite.PAPER_TRADE` is frozen at startup from the .env value.
+# To allow flipping paper <-> live via Telegram without a restart, we keep
+# a mutable module-level override. Every code site that used to check
+# `settings.kite.PAPER_TRADE` now calls `is_paper_trade()` instead, which
+# honours the override when set and falls back to the config value otherwise.
+#
+# The override is intentionally in-memory only — a restart reverts to the
+# .env default. This prevents a bot that crashed while in LIVE mode from
+# silently coming back up live when the operator wanted paper.
+
+_PAPER_TRADE_OVERRIDE: Optional[bool] = None
+
+
+def is_paper_trade() -> bool:
+    """Return the effective paper-trade flag (runtime override wins)."""
+    if _PAPER_TRADE_OVERRIDE is not None:
+        return _PAPER_TRADE_OVERRIDE
+    return bool(settings.kite.PAPER_TRADE)
+
+
+def set_paper_trade_override(value: Optional[bool]) -> None:
+    """
+    Set (or clear) the runtime paper-trade override.
+
+    value=True  → force paper mode
+    value=False → force live mode
+    value=None  → clear override, fall back to .env PAPER_TRADE
+    """
+    global _PAPER_TRADE_OVERRIDE
+    _PAPER_TRADE_OVERRIDE = value
