@@ -136,7 +136,7 @@ stop at the next pause checkpoint, commit WIP, and resume later.
 
 ## Week 3 — Execution alpha + observability
 
-### Task 6 — Passive limit orders with market fallback
+### Task 6 — Passive limit orders with market fallback ✅ COMPLETE
 **Scope:**
 - `execution.py`: `place_passive_limit()` at mid ± spread/4, 90-sec TTL, fallback to market.
 - Behind `EXECUTION_PASSIVE_MODE` flag (default OFF).
@@ -231,7 +231,7 @@ If any session hits the quota warning:
 - [x] Task 3 — Backtester strategy adapter
 - [x] Task 4 — Alpha threshold + confidence Kelly
 - [x] Task 5 — Sector cap + MTM stop
-- [ ] Task 6 — Passive limit orders
+- [x] Task 6 — Passive limit orders
 - [ ] Task 7 — Slippage monitor + daily digest
 - [ ] Task 8 — Cost fidelity (R-16)
 - [ ] Task 9 — News blackout

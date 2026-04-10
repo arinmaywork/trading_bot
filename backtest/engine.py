@@ -249,9 +249,31 @@ class BacktestEngine:
          (to avoid same-bar look-ahead bias).
     """
 
-    def __init__(self, strategy: Strategy, product: str = "MIS") -> None:
+    def __init__(
+        self,
+        strategy: Strategy,
+        product: str = "MIS",
+        slippage_bps: float = 0.0,
+    ) -> None:
+        """
+        Parameters
+        ----------
+        slippage_bps
+            Per-leg transaction-cost slippage applied to every fill price
+            before P&L is computed. BUY legs pay ``+bps`` (filled above the
+            bar open), SELL legs receive ``-bps`` (filled below). Lets the
+            Task-6 A/B compare an aggressive execution baseline against a
+            passive-quote execution model without changing the strategy.
+        """
         self.strategy = strategy
         self.product  = product
+        self.slippage_bps = float(slippage_bps)
+
+    def _apply_slippage(self, px: float, side: str) -> float:
+        if self.slippage_bps == 0 or px <= 0:
+            return px
+        mult = 1.0 + (self.slippage_bps / 10_000.0)
+        return px * mult if side == "BUY" else px / mult
 
     def run(
         self,
@@ -278,7 +300,8 @@ class BacktestEngine:
         for i, (ts, bar) in enumerate(bar_list):
             # 1. Execute pending signal at current bar's open (next bar from signal POV)
             if pending is not None:
-                fill_px = float(bar["open"])
+                raw_open = float(bar["open"])
+                fill_px  = self._apply_slippage(raw_open, pending.action)
                 if pending.action == "BUY":
                     cost_in  = leg_cost(fill_px, pending.qty, "BUY", self.product)  # type: ignore[arg-type]
                     open_trade = Trade(
@@ -313,7 +336,7 @@ class BacktestEngine:
         # End-of-fold: force-close any open position at the last bar's close
         if open_trade is not None:
             last_ts, last_bar = bar_list[-1]
-            fill_px = float(last_bar["close"])
+            fill_px = self._apply_slippage(float(last_bar["close"]), "SELL")
             cost_out = leg_cost(fill_px, open_trade.qty, "SELL", self.product)  # type: ignore[arg-type]
             open_trade.exit_ts   = last_ts
             open_trade.exit_px   = fill_px
@@ -402,13 +425,17 @@ def run_walk_forward(
     strategy_factory: Callable[[], Strategy],
     splitter:   Optional[PurgedWalkForward] = None,
     product:    str = "MIS",
+    slippage_bps: float = 0.0,
 ) -> List[BacktestResult]:
     splitter = splitter or PurgedWalkForward(n_splits=5, embargo_pct=0.02)
     folds    = splitter.split(len(bars))
     results: List[BacktestResult] = []
     for fold in folds:
         test_slice = bars.iloc[fold.test_start : fold.test_end]
-        engine = BacktestEngine(strategy=strategy_factory(), product=product)
+        engine = BacktestEngine(
+            strategy=strategy_factory(), product=product,
+            slippage_bps=slippage_bps,
+        )
         res = engine.run(symbol=symbol, bars=test_slice, fold_k=fold.k)
         results.append(res)
         pf = "∞" if math.isinf(res.profit_factor) else f"{res.profit_factor:.2f}"
@@ -453,6 +480,14 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--report-csv",
         default="backtest/reports/fold_summary.csv",
         help="Write per-fold summary to this CSV",
+    )
+    p.add_argument(
+        "--slippage-bps",
+        type=float,
+        default=0.0,
+        help="Per-leg slippage in bps applied to every fill (Task-6 A/B). "
+             "BUY pays +bps, SELL receives -bps. 10 = aggressive baseline, "
+             "2 = passive-quote model.",
     )
     return p.parse_args(argv)
 
@@ -518,6 +553,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             strategy_factory=factory,
             splitter=splitter,
             product="MIS",
+            slippage_bps=args.slippage_bps,
         )
         all_results.extend(results)
 

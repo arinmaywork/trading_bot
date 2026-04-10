@@ -56,6 +56,22 @@ class KiteConfig:
     PAPER_TRADE:            bool  = field(
         default_factory=lambda: _optional("PAPER_TRADE", "false").lower() == "true"
     )
+    # ── Task-6: passive limit order mode ─────────────────────────────────
+    # When enabled, new entries are posted INSIDE the spread at
+    # mid ± spread/PASSIVE_SPREAD_DIVISOR. The order rests up to
+    # PASSIVE_LIMIT_TTL_S seconds; on timeout it's cancelled and replaced
+    # with an aggressive LIMIT order (existing _place_single_order path).
+    # Default OFF so upgrades don't silently change live-order behaviour.
+    EXECUTION_PASSIVE_MODE: bool  = field(
+        default_factory=lambda: _optional("EXECUTION_PASSIVE_MODE", "false").lower() == "true"
+    )
+    PASSIVE_LIMIT_TTL_S:     float = 90.0
+    PASSIVE_SPREAD_DIVISOR:  float = 4.0
+    PASSIVE_POLL_INTERVAL_S: float = 2.0
+    # Paper-mode passive fill models capture passive-order alpha without
+    # hitting the broker. Maker rebate shaves ~3 bps off expected slippage.
+    PASSIVE_PAPER_SLIP_BPS:  float = 2.0   # bps vs signal price when passive fill
+    PASSIVE_FILL_PROB:       float = 0.70  # P(rest order fills within TTL in paper)
 
 
 # ---------------------------------------------------------------------------

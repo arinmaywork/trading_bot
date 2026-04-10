@@ -335,6 +335,7 @@ python main.py
 | `MAX_SECTOR_EXPOSURE_PCT` | — | Task-5: max gross exposure per sector. Default `0.30` (30% of capital) |
 | `INTRADAY_MTM_STOP_ENABLED` | — | Task-5: halt new entries when (realised + unrealised) ≤ −`INTRADAY_MTM_STOP_PCT` × capital. Latches until next session 09:15 IST. Default `true` |
 | `INTRADAY_MTM_STOP_PCT` | — | Task-5: intraday MTM drawdown threshold. Default `0.015` (−1.5% of capital) |
+| `EXECUTION_PASSIVE_MODE` | — | Task-6: route new orders through passive limit (mid ± spread/4), 90 s TTL, aggressive fallback on timeout. Default `false` |
 
 ---
 

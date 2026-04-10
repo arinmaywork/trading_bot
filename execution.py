@@ -514,6 +514,247 @@ class OrderExecutor:
 
         return None, None, "Max retries exhausted"
 
+    # ── Task-6: passive (maker) limit order path ────────────────────────
+    async def _fetch_quote_book(
+        self, symbol: str
+    ) -> Tuple[float, float, float]:
+        """
+        Returns ``(bid, ask, ltp)`` for ``symbol`` via ``kite.quote``.
+
+        On any failure returns ``(0.0, 0.0, 0.0)`` so the caller can fall
+        back to the aggressive limit path. kite.quote() is synchronous, so
+        it's wrapped in run_in_executor under request_slot rate limiting.
+        """
+        key = f"{settings.kite.EXCHANGE}:{symbol}"
+        try:
+            async with self._limiter.request_slot():
+                loop = asyncio.get_running_loop()
+                q = await loop.run_in_executor(
+                    None, lambda: self._kite.quote([key])
+                )
+            entry = q.get(key) or {}
+            depth = entry.get("depth") or {}
+            bids  = depth.get("buy")  or []
+            asks  = depth.get("sell") or []
+            bid = float(bids[0]["price"]) if bids else 0.0
+            ask = float(asks[0]["price"]) if asks else 0.0
+            ltp = float(entry.get("last_price", 0.0) or 0.0)
+            return bid, ask, ltp
+        except Exception as exc:
+            logger.debug("quote fetch failed for %s: %s", symbol, exc)
+            return 0.0, 0.0, 0.0
+
+    @staticmethod
+    def _round_tick(price: float) -> float:
+        """Round to NSE tick size (₹0.05)."""
+        return round(round(price / 0.05) * 0.05, 2)
+
+    async def _poll_order_until(
+        self,
+        order_id: str,
+        deadline_mono: float,
+        poll_interval: float,
+    ) -> Tuple[str, float, int]:
+        """
+        Poll Kite's order history until the order is COMPLETE, the order is
+        no longer open (REJECTED / CANCELLED), or the deadline passes.
+
+        Returns ``(status, avg_fill_price, filled_qty)``. On any polling
+        error we return ``("UNKNOWN", 0.0, 0)`` so the caller treats it as
+        a timeout and falls back to the market path.
+        """
+        loop = asyncio.get_running_loop()
+        last_status = "OPEN"
+        avg_price  = 0.0
+        filled_qty = 0
+
+        while time.monotonic() < deadline_mono:
+            try:
+                async with self._limiter.request_slot():
+                    history = await loop.run_in_executor(
+                        None, lambda oid=order_id: self._kite.order_history(oid)
+                    )
+                if history:
+                    last = history[-1]
+                    last_status = str(last.get("status", "")).upper()
+                    avg_price   = float(last.get("average_price", 0.0) or 0.0)
+                    filled_qty  = int(last.get("filled_quantity", 0) or 0)
+                    if last_status in ("COMPLETE",):
+                        return last_status, avg_price, filled_qty
+                    if last_status in ("REJECTED", "CANCELLED"):
+                        return last_status, avg_price, filled_qty
+            except Exception as exc:
+                logger.debug("order_history poll failed for %s: %s", order_id, exc)
+                return "UNKNOWN", avg_price, filled_qty
+
+            await asyncio.sleep(poll_interval)
+
+        # Deadline hit — caller will cancel and fall back to market
+        return last_status or "TIMEOUT", avg_price, filled_qty
+
+    async def _cancel_order(self, order_id: str) -> bool:
+        try:
+            cfg = settings.kite
+            async with self._limiter.order_slot():
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None,
+                    lambda: self._kite.cancel_order(
+                        variety=cfg.ORDER_VARIETY, order_id=order_id
+                    ),
+                )
+            return True
+        except Exception as exc:
+            logger.warning("cancel_order(%s) failed: %s", order_id, exc)
+            return False
+
+    async def place_passive_limit(
+        self,
+        symbol:       str,
+        direction:    TradeDirection,
+        quantity:     int,
+        tag:          str   = "",
+        signal_price: float = 0.0,
+        product_type: str   = "",
+    ) -> Tuple[Optional[str], Optional[float], Optional[str]]:
+        """
+        Task-6: post a passive LIMIT order INSIDE the spread at
+        ``mid ± spread / PASSIVE_SPREAD_DIVISOR`` (BUY sits below mid, SELL
+        above), poll for fill up to ``PASSIVE_LIMIT_TTL_S`` seconds, and
+        fall back to the aggressive ``_place_single_order`` path on any
+        timeout / cancel / rejection / quote-fetch failure.
+
+        Returns ``(order_id, fill_price, error)`` with the same contract as
+        ``_place_single_order`` so ``execute()`` can treat both identically.
+        """
+        cfg = settings.kite
+
+        bid, ask, quote_ltp = await self._fetch_quote_book(symbol)
+        if bid <= 0 or ask <= 0 or ask <= bid:
+            logger.info(
+                "Passive[%s]: no valid book (bid=%.2f ask=%.2f) — falling back to aggressive",
+                symbol, bid, ask,
+            )
+            return await self._place_single_order(
+                symbol       = symbol,
+                direction    = direction,
+                quantity     = quantity,
+                tag          = tag,
+                limit_price  = signal_price or quote_ltp or 0.0,
+                product_type = product_type,
+            )
+
+        spread  = ask - bid
+        mid     = (bid + ask) / 2.0
+        divisor = max(1.0, float(cfg.PASSIVE_SPREAD_DIVISOR))
+        offset  = spread / divisor
+
+        if direction == TradeDirection.BUY:
+            passive_price = self._round_tick(mid - offset)
+            # Safety: never cross the ask on a passive BUY
+            passive_price = min(passive_price, self._round_tick(bid))
+        else:
+            passive_price = self._round_tick(mid + offset)
+            passive_price = max(passive_price, self._round_tick(ask))
+
+        # ── Place the maker order ───────────────────────────────────────
+        kite_transaction = (
+            self._kite.TRANSACTION_TYPE_BUY
+            if direction == TradeDirection.BUY
+            else self._kite.TRANSACTION_TYPE_SELL
+        )
+        _product = product_type if product_type in ("MIS", "CNC") else cfg.PRODUCT
+
+        def _sync_place_passive() -> str:
+            return self._kite.place_order(
+                variety          = cfg.ORDER_VARIETY,
+                exchange         = cfg.EXCHANGE,
+                tradingsymbol    = symbol,
+                transaction_type = kite_transaction,
+                quantity         = quantity,
+                product          = _product,
+                order_type       = "LIMIT",
+                price            = passive_price,
+                tag              = (tag[:20] if tag else "SS_PASSIVE"),
+            )
+
+        try:
+            async with self._limiter.order_slot():
+                loop = asyncio.get_running_loop()
+                order_id = await loop.run_in_executor(None, _sync_place_passive)
+        except KiteExceptions.TokenException:
+            raise
+        except KiteExceptions.PermissionException as exc:
+            # Delegate to the standard aggressive-path handler which already
+            # deals with the one-alert-per-session guard.
+            logger.warning("Passive[%s]: PermissionException → aggressive path", symbol)
+            return await self._place_single_order(
+                symbol=symbol, direction=direction, quantity=quantity,
+                tag=tag, limit_price=signal_price, product_type=product_type,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Passive[%s] place failed (%s) — falling back to aggressive",
+                symbol, exc,
+            )
+            return await self._place_single_order(
+                symbol=symbol, direction=direction, quantity=quantity,
+                tag=tag, limit_price=signal_price, product_type=product_type,
+            )
+
+        logger.info(
+            "Passive[%s]: %s %d @ ₹%.2f (mid ₹%.2f, spread ₹%.2f) order_id=%s TTL=%.0fs",
+            symbol, direction.value, quantity, passive_price, mid, spread,
+            order_id, cfg.PASSIVE_LIMIT_TTL_S,
+        )
+
+        # ── Poll until filled / cancelled / timeout ─────────────────────
+        deadline = time.monotonic() + float(cfg.PASSIVE_LIMIT_TTL_S)
+        status, avg_fill, filled_qty = await self._poll_order_until(
+            order_id      = order_id,
+            deadline_mono = deadline,
+            poll_interval = float(cfg.PASSIVE_POLL_INTERVAL_S),
+        )
+
+        if status == "COMPLETE" and filled_qty >= quantity:
+            logger.info(
+                "Passive[%s] FILLED: %d @ ₹%.2f (order_id=%s)",
+                symbol, filled_qty, avg_fill, order_id,
+            )
+            return order_id, avg_fill or passive_price, None
+
+        # Partial, timeout, or cancel: cancel the resting order then fall back
+        if status not in ("REJECTED", "CANCELLED"):
+            cancelled = await self._cancel_order(order_id)
+            logger.info(
+                "Passive[%s] TTL/partial: status=%s filled=%d/%d cancel_ok=%s → aggressive",
+                symbol, status, filled_qty, quantity, cancelled,
+            )
+
+        remaining = max(quantity - int(filled_qty or 0), 0)
+        if remaining <= 0:
+            # Everything already matched — return the passive fill
+            return order_id, avg_fill or passive_price, None
+
+        # Aggressive fallback for the remaining quantity
+        agg_id, agg_fill, agg_err = await self._place_single_order(
+            symbol       = symbol,
+            direction    = direction,
+            quantity     = remaining,
+            tag          = tag,
+            limit_price  = signal_price or quote_ltp or passive_price,
+            product_type = product_type,
+        )
+        if agg_id is None:
+            return None, None, agg_err or f"passive+fallback failed (status={status})"
+
+        # Blended fill price across the partial-passive + aggressive legs
+        if filled_qty > 0 and avg_fill > 0 and agg_fill and agg_fill > 0:
+            blended = (avg_fill * filled_qty + agg_fill * remaining) / quantity
+        else:
+            blended = agg_fill or passive_price
+        return agg_id, blended, None
+
     async def _get_ltp(self, symbol: str) -> float:
         """
         Fetch Last Traded Price for slippage calculation.
@@ -603,14 +844,27 @@ class OrderExecutor:
 
             # ---- Paper trade mode: simulate fill without hitting Zerodha ----
             place_err: Optional[str] = None
+            _passive_on = bool(getattr(settings.kite, "EXECUTION_PASSIVE_MODE", False))
             if is_paper_trade():
                 simulated_id = f"PAPER-{signal.symbol}-{idx}-{int(time.time())}"
-                # Realistic slippage: ±0.10% based on direction.
-                # BUY  orders fill slightly above signal price (market lift).
-                # SELL orders fill slightly below signal price (market give).
-                # Additionally, each extra slice adds 0.02% of incremental impact
-                # to model queue/market-depth friction on large orders.
-                _slip_bps  = 10.0 + idx * 2.0          # basis points (10 bps base + 2/slice)
+                # Realistic slippage model:
+                #   Aggressive path: 10 bps base + 2 bps / extra slice.
+                #   Passive path (Task-6): ~2 bps edge thanks to maker rebate,
+                #     but only PASSIVE_FILL_PROB of orders actually fill within
+                #     TTL — the rest time out and pay the aggressive slippage.
+                if _passive_on:
+                    import random as _rnd
+                    _kcfg = settings.kite
+                    if _rnd.random() < _kcfg.PASSIVE_FILL_PROB:
+                        _slip_bps = float(_kcfg.PASSIVE_PAPER_SLIP_BPS) + idx * 0.5
+                        _path_tag = "passive"
+                    else:
+                        _slip_bps = 10.0 + idx * 2.0   # fallback to aggressive
+                        _path_tag = "passive→agg"
+                else:
+                    _slip_bps = 10.0 + idx * 2.0
+                    _path_tag = "aggressive"
+
                 _slip_mult = 1.0 + (_slip_bps / 10_000)
                 if signal.direction.value.upper() in ("BUY", "LONG"):
                     simulated_fill = round(signal.current_price * _slip_mult, 2)
@@ -618,11 +872,20 @@ class OrderExecutor:
                     simulated_fill = round(signal.current_price / _slip_mult, 2)
                 order_id, fill_price = simulated_id, simulated_fill
                 logger.info(
-                    "[PAPER] Simulated order: %s %s %d shares @ ₹%.2f "
+                    "[PAPER %s] Simulated order: %s %s %d shares @ ₹%.2f "
                     "(signal ₹%.2f, slip=%.1f bps) | id=%s",
-                    signal.direction.value, signal.symbol,
+                    _path_tag, signal.direction.value, signal.symbol,
                     order_slice.quantity, simulated_fill,
                     signal.current_price, _slip_bps, simulated_id,
+                )
+            elif _passive_on:
+                order_id, fill_price, place_err = await self.place_passive_limit(
+                    symbol       = signal.symbol,
+                    direction    = signal.direction,
+                    quantity     = order_slice.quantity,
+                    tag          = tag,
+                    signal_price = signal.current_price,
+                    product_type = getattr(signal, "product_type", ""),
                 )
             else:
                 order_id, fill_price, place_err = await self._place_single_order(
