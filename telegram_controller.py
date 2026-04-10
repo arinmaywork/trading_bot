@@ -190,8 +190,15 @@ class TelegramController:
         self._digest_provider  = None
         # Task-9: NewsBlackoutManager reference for /blackouts command
         self._news_blackout    = None
+        # UniverseEngine reference — populated by main.py via set_universe()
+        self._universe         = None
+        self._backtest_running = False
 
     # ── Token hot-swap ────────────────────────────────────────────────────
+
+    def set_universe(self, universe: Any) -> None:
+        """Register the UniverseEngine so /backtest can pull active symbols."""
+        self._universe = universe
 
     def set_kite(self, kite: Any, api_secret: str,
                  token_cache_file: Optional[Path] = None) -> None:
@@ -441,6 +448,7 @@ class TelegramController:
                 "/risk — Portfolio loss-budget (D/W/M + blacklist)\n"
                 "/digest — On-demand end-of-day digest (slippage + P&amp;L)\n"
                 "/blackouts — Active news-event blackouts (on|off|clear)\n"
+                "/backtest &lt;days&gt; — Run historical backtest (e.g. /backtest 15)\n"
                 "/balance — Show Zerodha equity balance\n"
                 "/synccapital — Resync capital from Zerodha balance\n"
                 "/capital &lt;amount&gt; — Set capital manually (shows budgets)\n"
@@ -454,6 +462,43 @@ class TelegramController:
             )
             if not self._state.mode_confirmed:
                 await self.send_mode_selector()
+
+        elif cmd == "/backtest":
+            # ── Historical Backtest Bridge ──────────────────────────────
+            if self._backtest_running:
+                await self.send("⚠️ A backtest is already running. Please wait for it to complete.")
+            elif self._universe is None:
+                await self.send("⚠️ Universe not initialised yet. Try again in a minute.")
+            else:
+                parts = text.strip().split()
+                days = 30
+                if len(parts) > 1:
+                    try:
+                        days = int(parts[1])
+                        if days < 1 or days > 365:
+                            raise ValueError
+                    except ValueError:
+                        await self.send("⚠️ Usage: <code>/backtest &lt;days&gt;</code> (1-365 days)")
+                        return
+
+                symbols = self._universe.get_active_symbols()
+                if not symbols:
+                    await self.send("⚠️ No active symbols in universe to backtest.")
+                    return
+
+                self._backtest_running = True
+                await self.send(
+                    f"🧪 <b>Starting Backtest</b>\n"
+                    f"{'─' * 28}\n"
+                    f"📅 <b>Period:</b>   Last {days} days\n"
+                    f"🔢 <b>Symbols:</b>  {len(symbols)}\n"
+                    f"⚙️ <b>Strategy:</b> live_risk (XGB+Kelly)\n"
+                    f"💰 <b>Capital:</b>  ₹{self._state.paper_capital:,.0f}\n\n"
+                    f"<i>This may take a minute...</i>"
+                )
+                
+                # Run in background to avoid blocking Telegram polling
+                asyncio.create_task(self._run_backtest_task(symbols, days))
 
         elif cmd == "/mode":
             await self.send_mode_selector()
@@ -998,6 +1043,69 @@ class TelegramController:
                 f"Send /status anytime for a live update."
             )
             logger.info("Trading mode set to: %s", chosen.value)
+
+    async def _run_backtest_task(self, symbols: list, days: int) -> None:
+        """Run backtest in a thread and send results to Telegram."""
+        try:
+            from backtest.engine import main as bt_main
+            from datetime import timedelta, date
+
+            end_dt   = date.today()
+            start_dt = end_dt - timedelta(days=days)
+            
+            # Prepare arguments for backtest engine
+            # --symbol is comma-separated list
+            bt_args = [
+                "--symbol", ",".join(symbols),
+                "--start", start_dt.isoformat(),
+                "--end", end_dt.isoformat(),
+                "--strategy", "live_risk",
+                "--capital", str(self._state.paper_capital),
+                "--report-csv", "backtest/reports/telegram_last_run.csv",
+                "--n-splits", "3",  # fewer splits for faster Telegram feedback
+            ]
+            
+            # Execute in thread executor to not block the bot
+            loop = asyncio.get_running_loop()
+            
+            # Capture stdout to get the summary table
+            import io
+            import sys
+            from contextlib import redirect_stdout
+
+            f = io.StringIO()
+            with redirect_stdout(f):
+                await loop.run_in_executor(None, bt_main, bt_args)
+            
+            output = f.getvalue()
+            
+            # Extract the summary section (the part between === lines)
+            summary = ""
+            lines = output.split("\n")
+            in_summary = False
+            for line in lines:
+                if "Backtest summary" in line:
+                    in_summary = True
+                if in_summary:
+                    summary += line + "\n"
+                    if "===" in line and len(summary.split("\n")) > 5:
+                        # Found the second === line
+                        break
+            
+            if not summary:
+                # Fallback if parsing fails
+                summary = "Backtest completed but summary parsing failed. Check terminal logs."
+
+            await self.send(
+                f"✅ <b>Backtest Complete</b>\n"
+                f"<pre>{summary}</pre>"
+            )
+
+        except Exception as exc:
+            logger.error("Backtest task failed: %s", exc, exc_info=True)
+            await self.send(f"❌ <b>Backtest failed</b>\nError: <code>{exc}</code>")
+        finally:
+            self._backtest_running = False
 
     # ── Polling loop ──────────────────────────────────────────────────────
 

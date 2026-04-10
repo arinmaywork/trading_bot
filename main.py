@@ -1425,6 +1425,7 @@ async def main(kite: KiteConnect, access_token: str, tg_offset: int = 0) -> None
     )
 
     universe_engine = UniverseEngine(kite, redis_client, rate_limiter)
+    tg_controller.set_universe(universe_engine)
     universe_engine.update_macro_signals(
         weather_anomaly=alt_data.weather.get_aggregate_anomaly(),
         sentiment_score=0.0, geo_risk=gri_init.composite,
