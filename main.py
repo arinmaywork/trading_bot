@@ -502,6 +502,8 @@ async def strategy_loop(
     logbook: Any = None,
     bot_state: Any = None,
     portfolio_risk: Optional["PortfolioRiskMonitor"] = None,  # R-13
+    digest_scheduler: Optional[Any] = None,                   # Task-7
+    loop_state_holder: Any = None,                            # Task-7
 ) -> None:
     """
     Main evaluation loop with:
@@ -725,6 +727,9 @@ async def strategy_loop(
 
             # Task-5: cache for next cycle's portfolio-risk check
             _strategy_loop_state.last_ltp_map = dict(ltp_map)
+            # Task-7: mirror into cross-thread holder for /digest command
+            if loop_state_holder is not None:
+                loop_state_holder.last_ltp_map = _strategy_loop_state.last_ltp_map
 
             # Diagnostic: log LTP health every 10 cycles
             priced = sum(1 for p in ltp_map.values() if p > 0)
@@ -1034,6 +1039,29 @@ async def strategy_loop(
             continue
         # ── End forced square-off ────────────────────────────────────────────
 
+        # ── Task-7: End-of-day Telegram digest (fires once at 15:25 IST) ────
+        if digest_scheduler is not None and digest_scheduler.should_fire(_ist_now):
+            try:
+                from monitor import build_digest, format_digest
+                _stats = build_digest(
+                    day=_ist_now.date(),
+                    positions=pos_manager.snapshot_positions(),
+                    entry_prices=pos_manager.snapshot_entry_prices(),
+                    ltp_map=_strategy_loop_state.last_ltp_map,
+                )
+                await telegram.send(format_digest(_stats))
+                if _stats.slippage_status == "DEGRADING":
+                    await telegram.send(
+                        f"⚠️ <b>Slippage degrading</b>\n"
+                        f"Today: {_stats.avg_slippage_bps:.1f} bps  |  "
+                        f"10d baseline: {_stats.baseline_slippage:.1f} bps  "
+                        f"(Δ +{_stats.avg_slippage_bps - _stats.baseline_slippage:.1f} bps)"
+                    )
+                digest_scheduler.mark_fired(_ist_now.date())
+                logger.info("Task-7 digest sent for %s", _ist_now.date())
+            except Exception as _dexc:
+                logger.exception("Task-7 digest send failed: %s", _dexc)
+
         # ---- Per-symbol signal evaluation ----
         actionable_count = 0
         for symbol in active_symbols:
@@ -1087,6 +1115,21 @@ async def strategy_loop(
                             symbol,
                         )
                         continue
+
+                    # ── Task-9: News-event blackout gate ───────────────────
+                    # Skip new entries on any symbol whose key_entities were
+                    # flagged by a high-impact sentiment headline within the
+                    # last NEWS_BLACKOUT_DURATION_S seconds.
+                    try:
+                        if news_blackout_mgr.is_blackout(symbol):
+                            _nb_rem = news_blackout_mgr.remaining_s(symbol)
+                            logger.info(
+                                "Task-9 NewsBlackout: skipping %s %s (%.0f s left)",
+                                sig.direction.value, symbol, _nb_rem,
+                            )
+                            continue
+                    except Exception as _nbexc:
+                        logger.debug("NewsBlackout gate failed: %s", _nbexc)
 
                     # ── Cooldown guard ─────────────────────────────────────
                     now_mono = time.monotonic()
@@ -1343,6 +1386,33 @@ async def main(kite: KiteConnect, access_token: str, tg_offset: int = 0) -> None
         capital=settings.strategy.TOTAL_CAPITAL
     )   # R-13: Portfolio loss-budget monitor
     tg_controller.set_portfolio_risk(portfolio_risk_monitor)
+    # Task-7: End-of-day digest scheduler (per-day latch, fires once at 15:25 IST)
+    from monitor import DigestScheduler
+    digest_scheduler = DigestScheduler()
+    # Task-9: News-event blackout manager (5-min per-symbol cooldown on high-impact news)
+    from news_blackout import NewsBlackoutManager
+    _scfg = settings.strategy
+    news_blackout_mgr = NewsBlackoutManager(
+        duration_s=_scfg.NEWS_BLACKOUT_DURATION_S,
+        score_threshold=_scfg.NEWS_BLACKOUT_SCORE_THRESHOLD,
+        enabled=_scfg.NEWS_BLACKOUT_ENABLED,
+    )
+    tg_controller.set_news_blackout(news_blackout_mgr)
+    # On-demand /digest provider — pulls live snapshots from PositionManager + loop state
+    def _digest_provider():
+        try:
+            return (
+                pos_manager.snapshot_positions(),
+                pos_manager.snapshot_entry_prices(),
+                dict(getattr(_strategy_loop_state_holder, "last_ltp_map", {})),
+            )
+        except Exception:
+            return ({}, {}, {})
+    # Holder so telegram can reach the latest strategy_loop state snapshot
+    class _StrategyLoopStateHolder:
+        last_ltp_map: Dict[str, float] = {}
+    _strategy_loop_state_holder = _StrategyLoopStateHolder()
+    tg_controller.set_digest_provider(_digest_provider)
     # R-14: Wire broker-balance fetcher so /balance and /synccapital work.
     tg_controller.set_margin_fetcher(executor.get_margins)
 
@@ -1454,6 +1524,10 @@ async def main(kite: KiteConnect, access_token: str, tg_offset: int = 0) -> None
                         gpr_context="",
                     )
                     alt_data.update_sentiment(_gri_result)
+                    try:
+                        news_blackout_mgr.update(_gri_result)
+                    except Exception:
+                        pass
                     logger.info(
                         "GRI-synthetic sentiment: %s score=%.3f | GRI=%.3f (%s)",
                         _gri_result.sentiment_classification,
@@ -1516,6 +1590,20 @@ async def main(kite: KiteConnect, access_token: str, tg_offset: int = 0) -> None
                         )
                     
                     alt_data.update_sentiment(result)
+                    # Task-9: latch news-event blackouts on high-impact headlines
+                    try:
+                        _latched = news_blackout_mgr.update(result)
+                        if _latched:
+                            await telegram.send(
+                                f"🚫 <b>News blackout latched</b>\n"
+                                f"{result.sentiment_classification} "
+                                f"{result.sentiment_score:+.2f} — "
+                                f"{int(news_blackout_mgr.duration_s)}s cooldown\n"
+                                f"Symbols: <code>{', '.join(_latched[:10])}</code>"
+                                + ("…" if len(_latched) > 10 else "")
+                            )
+                    except Exception as _bexc:
+                        logger.debug("Blackout update failed: %s", _bexc)
                     logger.info(
                         "Sentiment [next in %ds]: %s score=%.3f conf=%.2f | '%s'",
                         interval, result.sentiment_classification,
@@ -1579,6 +1667,8 @@ async def main(kite: KiteConnect, access_token: str, tg_offset: int = 0) -> None
             pos_manager=pos_manager, # R-12: Risk management
             logbook=logbook, bot_state=bot_state,
             portfolio_risk=portfolio_risk_monitor,  # R-13
+            digest_scheduler=digest_scheduler,       # Task-7
+            loop_state_holder=_strategy_loop_state_holder,  # Task-7
         ), name="strategy_loop",
     )
     sentiment_task    = asyncio.create_task(sentiment_loop(), name="sentiment_loop")

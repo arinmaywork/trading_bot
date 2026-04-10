@@ -157,7 +157,7 @@ stop at the next pause checkpoint, commit WIP, and resume later.
 
 ---
 
-### Task 7 — Slippage monitor + daily Telegram digest
+### Task 7 — Slippage monitor + daily Telegram digest ✅ COMPLETE
 **Scope:**
 - `monitor.py` (new): rolling slippage from logbook CSVs, alert if degrading vs 10-day baseline.
 - 3:30 PM IST Telegram digest (trades, win rate, P&L, unrealized, biggest winner/loser, slippage bps, cost drag).
@@ -179,7 +179,7 @@ stop at the next pause checkpoint, commit WIP, and resume later.
 
 ## Week 4 — Fidelity + polish
 
-### Task 8 — Full Zerodha cost fidelity (R-16)
+### Task 8 — Full Zerodha cost fidelity (R-16) ✅ COMPLETE
 **Scope:**
 - Add GST (18% on brokerage+exchange), stamp duty (0.003% buy), SEBI turnover (₹10/crore) to `logbook.py`, `strategy.py` cost filter, and `backtest/cost_model.py`.
 - Verify against a real Zerodha contract note.
@@ -193,7 +193,7 @@ stop at the next pause checkpoint, commit WIP, and resume later.
 
 ---
 
-### Task 9 — News-event blackout
+### Task 9 — News-event blackout ✅ COMPLETE
 **Scope:**
 - 5-minute per-symbol cooldown after a high-impact sentiment headline.
 - Config flag; `/status` shows active blackouts.
@@ -232,6 +232,6 @@ If any session hits the quota warning:
 - [x] Task 4 — Alpha threshold + confidence Kelly
 - [x] Task 5 — Sector cap + MTM stop
 - [x] Task 6 — Passive limit orders
-- [ ] Task 7 — Slippage monitor + daily digest
-- [ ] Task 8 — Cost fidelity (R-16)
-- [ ] Task 9 — News blackout
+- [x] Task 7 — Slippage monitor + daily digest
+- [x] Task 8 — Cost fidelity (R-16)
+- [x] Task 9 — News blackout

@@ -266,7 +266,23 @@ class StrategyConfig:
     BROKERAGE_PER_ORDER:         float = 20.0    # ₹ per executed order (flat cap)
     BROKERAGE_PCT:               float = 0.0003  # 0.03% — used when < flat cap
     STT_INTRADAY_SELL_RATE:      float = 0.00025 # 0.025% STT on sell-side only (intraday)
-    EXCHANGE_CHARGE_RATE:        float = 0.0000345  # NSE turnover charge (both sides)
+    EXCHANGE_CHARGE_RATE:        float = 0.0000297  # 0.00297% NSE turnover (both sides)
+    # ---- Task-8 (R-16): full Zerodha cost fidelity ----
+    GST_RATE:                    float = 0.18     # 18% GST on (brokerage + exchange + SEBI)
+    STAMP_DUTY_INTRADAY_BUY_RATE: float = 0.00003 # 0.003% on BUY only for MIS
+    STAMP_DUTY_DELIVERY_BUY_RATE: float = 0.00015 # 0.015% on BUY only for CNC
+    SEBI_TURNOVER_RATE:          float = 0.0000010  # ₹10 / crore on both sides
+
+    # ---- Task-9: News-event blackout ----
+    NEWS_BLACKOUT_ENABLED: bool = field(
+        default_factory=lambda: _optional("NEWS_BLACKOUT_ENABLED", "true").lower() == "true"
+    )
+    NEWS_BLACKOUT_DURATION_S: float = field(
+        default_factory=lambda: float(_optional("NEWS_BLACKOUT_DURATION_S", "300"))
+    )
+    NEWS_BLACKOUT_SCORE_THRESHOLD: float = field(
+        default_factory=lambda: float(_optional("NEWS_BLACKOUT_SCORE_THRESHOLD", "0.50"))
+    )
 
     # Minimum ₹ value per trade so brokerage stays a small fraction of P&L.
     # Example: ₹2000 position → brokerage ≈ ₹40 → only 2% cost hurdle vs P&L.

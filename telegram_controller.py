@@ -186,6 +186,10 @@ class TelegramController:
         self._margin_fetcher   = None
         # ModelRotator reference — populated by main.py via set_rotator()
         self._rotator          = None
+        # Task-7: optional digest provider (zero-arg → (positions, entries, ltp))
+        self._digest_provider  = None
+        # Task-9: NewsBlackoutManager reference for /blackouts command
+        self._news_blackout    = None
 
     # ── Token hot-swap ────────────────────────────────────────────────────
 
@@ -225,6 +229,18 @@ class TelegramController:
         Call once from main.py.
         """
         self._portfolio_risk = monitor
+
+    def set_news_blackout(self, mgr: Any) -> None:
+        """Task-9: register the NewsBlackoutManager so /blackouts can query it."""
+        self._news_blackout = mgr
+
+    def set_digest_provider(self, provider) -> None:
+        """
+        Task-7: Register a zero-arg callable returning a tuple
+        ``(positions, entry_prices, ltp_map)`` so the /digest Telegram
+        command can build an on-demand end-of-day digest.
+        """
+        self._digest_provider = provider
 
     def set_margin_fetcher(self, fetcher) -> None:
         """
@@ -423,6 +439,8 @@ class TelegramController:
                 "📊 <b>P&amp;L &amp; Capital</b>\n"
                 "/pnl — Today's P&amp;L statement (MIS + CNC)\n"
                 "/risk — Portfolio loss-budget (D/W/M + blacklist)\n"
+                "/digest — On-demand end-of-day digest (slippage + P&amp;L)\n"
+                "/blackouts — Active news-event blackouts (on|off|clear)\n"
                 "/balance — Show Zerodha equity balance\n"
                 "/synccapital — Resync capital from Zerodha balance\n"
                 "/capital &lt;amount&gt; — Set capital manually (shows budgets)\n"
@@ -881,6 +899,58 @@ class TelegramController:
             except Exception as exc:
                 logger.error("/risk error: %s", exc, exc_info=True)
                 await self.send(f"❌ Could not render risk report: <code>{exc}</code>")
+
+        elif cmd == "/blackouts":
+            # ── Task-9: News-event blackout status ───────────────────────
+            try:
+                from news_blackout import format_blackouts
+                if self._news_blackout is None:
+                    await self.send(
+                        "⚠️ News blackout manager is not wired. "
+                        "Add <code>tg_controller.set_news_blackout(...)</code> in main.py."
+                    )
+                else:
+                    parts = text.strip().split(None, 1)
+                    arg = parts[1].strip().lower() if len(parts) > 1 else ""
+                    if arg == "clear":
+                        n = len(self._news_blackout)
+                        self._news_blackout.clear()
+                        await self.send(f"🧹 Cleared {n} active news blackout latch(es).")
+                    elif arg == "off":
+                        self._news_blackout.set_enabled(False)
+                        await self.send("📴 News blackout <b>disabled</b> for this session.")
+                    elif arg == "on":
+                        self._news_blackout.set_enabled(True)
+                        await self.send("✅ News blackout <b>enabled</b>.")
+                    else:
+                        await self.send(format_blackouts(self._news_blackout))
+            except Exception as exc:
+                logger.error("/blackouts error: %s", exc, exc_info=True)
+                await self.send(f"❌ Blackout query failed: <code>{exc}</code>")
+
+        elif cmd == "/digest":
+            # ── Task-7: On-demand end-of-day digest ──────────────────────
+            try:
+                from monitor import build_digest, format_digest
+                from datetime import datetime as _dt
+                positions: Dict[str, int] = {}
+                entries:   Dict[str, float] = {}
+                ltp_map:   Dict[str, float] = {}
+                if self._digest_provider is not None:
+                    try:
+                        positions, entries, ltp_map = self._digest_provider()
+                    except Exception as pexc:
+                        logger.warning("/digest provider failed: %s", pexc)
+                stats = build_digest(
+                    day=_ist_now().date(),
+                    positions=positions,
+                    entry_prices=entries,
+                    ltp_map=ltp_map,
+                )
+                await self.send(format_digest(stats))
+            except Exception as exc:
+                logger.error("/digest error: %s", exc, exc_info=True)
+                await self.send(f"❌ Digest failed: <code>{exc}</code>")
 
         elif cmd == "/resetquota":
             # ── Gemini quota emergency reset ─────────────────────────────────

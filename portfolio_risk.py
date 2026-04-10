@@ -74,24 +74,30 @@ def _load_trades_for_day(day: date) -> List[Dict[str, str]]:
 
 
 def _trade_cost(row: Dict[str, str]) -> float:
-    """Per-trade cost model — matches Logbook.get_pnl_report."""
-    cfg = settings.strategy
+    """Per-trade cost model — delegates to canonical backtest.cost_model."""
     try:
         price = float(row.get("fill_price", 0))
         qty   = int(float(row.get("qty", 0)))
     except (ValueError, TypeError):
         return 0.0
-    order_val = price * qty
-    brokerage = min(cfg.BROKERAGE_PER_ORDER, cfg.BROKERAGE_PCT * order_val)
-    exchange  = cfg.EXCHANGE_CHARGE_RATE * order_val
-    direction = (row.get("direction") or "").upper()
+    if price <= 0 or qty <= 0:
+        return 0.0
+    direction = (row.get("direction") or "BUY").upper()
     product   = (row.get("product_type") or "MIS").upper()
-    if direction == "SELL":
-        stt_rate = 0.001 if product == "CNC" else cfg.STT_INTRADAY_SELL_RATE
-        stt = stt_rate * order_val
-    else:
-        stt = (0.001 * order_val) if product == "CNC" else 0.0
-    return brokerage + exchange + stt
+    if direction not in ("BUY", "SELL"):
+        direction = "BUY"
+    if product not in ("MIS", "CNC"):
+        product = "MIS"
+    try:
+        from backtest.cost_model import leg_cost
+        return float(leg_cost(price, qty, direction, product).total)  # type: ignore[arg-type]
+    except Exception:
+        # Fallback: brokerage + exchange only (should never hit in practice)
+        cfg = settings.strategy
+        order_val = price * qty
+        brokerage = min(cfg.BROKERAGE_PER_ORDER, cfg.BROKERAGE_PCT * order_val)
+        exchange  = cfg.EXCHANGE_CHARGE_RATE * order_val
+        return brokerage + exchange
 
 
 def _fifo_net_pnl(rows: List[Dict[str, str]]) -> float:

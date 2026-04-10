@@ -567,15 +567,13 @@ class RiskManager:
         # Only place the trade if the expected P&L exceeds total round-trip cost.
         # If the Kelly qty is too small, try bumping to MIN_TRADE_VALUE first.
         if final > 0:
-            cfg_costs = settings.strategy
+            # Task-8 (R-16): route through canonical backtest.cost_model so
+            # live sizing matches backtest/logbook exactly, including
+            # GST + stamp duty + SEBI turnover charges.
+            from backtest.cost_model import round_trip_cost as _canon_rt_cost
 
             def _round_trip_cost(qty: int) -> float:
-                order_val   = current_price * qty
-                brok_buy    = min(cfg_costs.BROKERAGE_PER_ORDER, cfg_costs.BROKERAGE_PCT * order_val)
-                brok_sell   = min(cfg_costs.BROKERAGE_PER_ORDER, cfg_costs.BROKERAGE_PCT * order_val)
-                stt_sell    = cfg_costs.STT_INTRADAY_SELL_RATE * order_val
-                exch        = cfg_costs.EXCHANGE_CHARGE_RATE * order_val * 2  # both sides
-                return brok_buy + brok_sell + stt_sell + exch
+                return _canon_rt_cost(current_price, current_price, qty, "MIS")
 
             def _expected_pnl(qty: int) -> float:
                 return abs(ml_signal) * current_price * qty

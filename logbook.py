@@ -532,18 +532,20 @@ class Logbook:
             return "No trades recorded today."
 
         # ── per-trade cost helper ─────────────────────────────────────────
+        # Task-8 (R-16): delegate to canonical model for full Zerodha fidelity
+        # (brokerage + STT + exchange + SEBI + stamp + GST).
+        from backtest.cost_model import leg_cost as _leg_cost
         def _trade_cost(t: TradeLogRow) -> float:
-            order_val = t.fill_price * t.qty
-            brokerage = min(cfg.BROKERAGE_PER_ORDER, cfg.BROKERAGE_PCT * order_val)
-            exchange  = cfg.EXCHANGE_CHARGE_RATE * order_val
-            if t.direction == "SELL":
-                # STT on sell-side only for MIS; both sides for CNC
-                stt_rate = 0.001 if t.product_type == "CNC" else cfg.STT_INTRADAY_SELL_RATE
-                stt = stt_rate * order_val
-            else:
-                # CNC buy-side STT (0.1%)
-                stt = (0.001 * order_val) if t.product_type == "CNC" else 0.0
-            return round(brokerage + exchange + stt, 2)
+            direction = (t.direction or "BUY").upper()
+            product   = getattr(t, "product_type", "MIS") or "MIS"
+            if direction not in ("BUY", "SELL"):
+                direction = "BUY"
+            if product not in ("MIS", "CNC"):
+                product = "MIS"
+            return round(
+                _leg_cost(t.fill_price, t.qty, direction, product).total,  # type: ignore[arg-type]
+                2,
+            )
 
         # ── separate MIS / CNC ───────────────────────────────────────────
         mis_trades = [t for t in trades if getattr(t, "product_type", "MIS") == "MIS"]

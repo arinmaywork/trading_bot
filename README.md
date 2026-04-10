@@ -336,6 +336,69 @@ python main.py
 | `INTRADAY_MTM_STOP_ENABLED` | — | Task-5: halt new entries when (realised + unrealised) ≤ −`INTRADAY_MTM_STOP_PCT` × capital. Latches until next session 09:15 IST. Default `true` |
 | `INTRADAY_MTM_STOP_PCT` | — | Task-5: intraday MTM drawdown threshold. Default `0.015` (−1.5% of capital) |
 | `EXECUTION_PASSIVE_MODE` | — | Task-6: route new orders through passive limit (mid ± spread/4), 90 s TTL, aggressive fallback on timeout. Default `false` |
+| `NEWS_BLACKOUT_ENABLED` | — | Task-9: skip new entries on symbols flagged by high-impact headlines. Default `true` |
+| `NEWS_BLACKOUT_DURATION_S` | — | Task-9: cooldown window per flagged symbol. Default `300` (5 minutes) |
+| `NEWS_BLACKOUT_SCORE_THRESHOLD` | — | Task-9: minimum abs(sentiment_score) + non-Neutral classification required to latch. Default `0.50` |
+
+### Task-9: News-event blackout
+
+`news_blackout.py` ships a process-local `NewsBlackoutManager` that
+latches a per-symbol cooldown whenever the sentiment loop emits a
+high-impact headline (|score| ≥ `NEWS_BLACKOUT_SCORE_THRESHOLD` AND
+classification ∈ {Fear, Excitement}). The manager stamps an unlock time
+on every symbol listed in `SentimentResult.key_entities` and the
+`strategy_loop` entry gate returns FLAT for blacked-out symbols until
+the window elapses.
+
+Operations:
+
+```
+/blackouts         # list active latches with remaining seconds
+/blackouts clear   # wipe all latches
+/blackouts off     # disable for the current session
+/blackouts on      # re-enable
+```
+
+Lazy eviction: expired entries are cleaned up on `is_blackout` /
+`active_blackouts` reads, so no background task is needed.
+
+### Task-8: Full Zerodha cost fidelity (R-16)
+
+`backtest/cost_model.py` is now the **canonical** Zerodha cost schedule and
+every consumer (`logbook.py`, `portfolio_risk.py`, `strategy.py`,
+`backtest/engine.py`) delegates to it. Live and backtest results can no
+longer drift. Components covered:
+
+| Component | Rate | Notes |
+|---|---|---|
+| Brokerage | `min(₹20, 0.03% × turnover)` | per executed order |
+| STT | 0.025% SELL (MIS) / 0.1% both sides (CNC) | |
+| Exchange | 0.00297% × turnover | NSE txn, both sides |
+| SEBI | ₹10 / crore (0.0001%) | both sides |
+| Stamp duty | 0.003% MIS / 0.015% CNC | BUY side only |
+| GST | 18% × (brokerage + exchange + SEBI) | Zerodha convention |
+
+Rates are overridable via `config.py` (`GST_RATE`,
+`STAMP_DUTY_INTRADAY_BUY_RATE`, `STAMP_DUTY_DELIVERY_BUY_RATE`,
+`SEBI_TURNOVER_RATE`). Run `python -m backtest.cost_model` to execute the
+built-in parity check against a hand-computed contract note.
+
+### Task-7: Slippage monitor & daily digest
+
+`monitor.py` ships a stateless slippage + P&L aggregator plus a per-day latched
+scheduler (`DigestScheduler`) that fires a rich HTML Telegram card at **15:25
+IST**, five minutes before the forced square-off. The digest reports:
+
+* Trade legs + round-trips + win rate (FIFO-matched)
+* Realised / gross / unrealised P&L and total costs
+* Biggest winner + biggest loser (by round-trip P&L)
+* Avg qty-weighted absolute slippage vs 10-day rolling baseline
+* Slippage status (`NORMAL` / `DEGRADING` / `INSUFFICIENT`) with 🟢/🔴/⚪ flag
+* Cost drag in bps of notional turnover
+
+When slippage exceeds baseline by more than 5 bps (with ≥5 trades) a separate
+`⚠️ Slippage degrading` alert is pushed. An on-demand `/digest` Telegram command
+lets you pull the same card at any moment during the session.
 
 ---
 
