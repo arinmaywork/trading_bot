@@ -228,7 +228,7 @@ If any session hits the quota warning:
 
 - [x] Task 1 — BOOTSTRAP_MODE
 - [x] Task 2 — Backtester scaffold
-- [ ] Task 3 — Backtester strategy adapter
+- [x] Task 3 — Backtester strategy adapter
 - [ ] Task 4 — Alpha threshold + confidence Kelly
 - [ ] Task 5 — Sector cap + MTM stop
 - [ ] Task 6 — Passive limit orders

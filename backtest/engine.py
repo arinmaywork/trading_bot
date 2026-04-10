@@ -227,6 +227,7 @@ class BacktestResult:
     net_pnl:      float
     total_costs:  float
     win_rate:     float
+    profit_factor: float          # sum(wins) / |sum(losses)|, ∞ if no losses
     sharpe:       float
     max_dd:       float
     trades:       List[Trade] = field(default_factory=list)
@@ -270,7 +271,7 @@ class BacktestEngine:
             return BacktestResult(
                 symbol=symbol, fold=fold_k, n_bars=0, n_trades=0,
                 gross_pnl=0.0, net_pnl=0.0, total_costs=0.0,
-                win_rate=0.0, sharpe=0.0, max_dd=0.0,
+                win_rate=0.0, profit_factor=0.0, sharpe=0.0, max_dd=0.0,
             )
 
         pending: Optional[Signal] = None
@@ -294,6 +295,7 @@ class BacktestEngine:
                     open_trade.net_pnl   = open_trade.gross_pnl - open_trade.cost
                     running_pnl         += open_trade.net_pnl
                     trades.append(open_trade)
+                    _notify_trade_closed(self.strategy, open_trade)
                     open_trade = None
                 pending = None
 
@@ -319,8 +321,21 @@ class BacktestEngine:
             open_trade.cost     += cost_out.total
             open_trade.net_pnl   = open_trade.gross_pnl - open_trade.cost
             trades.append(open_trade)
+            _notify_trade_closed(self.strategy, open_trade)
 
         return _build_result(symbol, fold_k, bars, trades, equity_curve)
+
+
+def _notify_trade_closed(strategy: Strategy, trade: Trade) -> None:
+    """Forward a closed trade to the strategy if it opted into the hook."""
+    cb = getattr(strategy, "on_trade_closed", None)
+    if cb is None or trade.exit_ts is None:
+        return
+    try:
+        exit_dt = trade.exit_ts.to_pydatetime() if isinstance(trade.exit_ts, pd.Timestamp) else trade.exit_ts
+        cb(trade.symbol, float(trade.net_pnl), exit_dt)
+    except Exception as exc:
+        logger.debug("on_trade_closed hook failed: %s", exc)
 
 
 def _build_result(
@@ -336,6 +351,15 @@ def _build_result(
     net       = sum(t.net_pnl   for t in trades)
     wins      = sum(1 for t in trades if t.net_pnl > 0)
     win_rate  = wins / n_trades if n_trades else 0.0
+    # Profit factor = gross wins / |gross losses|. Inf if no losers. 0 if no winners.
+    gross_wins   = sum(t.net_pnl for t in trades if t.net_pnl > 0)
+    gross_losses = sum(-t.net_pnl for t in trades if t.net_pnl < 0)
+    if gross_losses > 0:
+        profit_factor = round(gross_wins / gross_losses, 3)
+    elif gross_wins > 0:
+        profit_factor = float("inf")
+    else:
+        profit_factor = 0.0
 
     # Sharpe from per-bar equity returns (annualised for ~252 × 375 minute bars)
     if len(equity_curve) > 1:
@@ -362,6 +386,7 @@ def _build_result(
         net_pnl=round(net, 2),
         total_costs=round(costs, 2),
         win_rate=round(win_rate, 4),
+        profit_factor=profit_factor,
         sharpe=round(sharpe, 3),
         max_dd=round(max_dd, 2),
         trades=trades,
@@ -386,11 +411,12 @@ def run_walk_forward(
         engine = BacktestEngine(strategy=strategy_factory(), product=product)
         res = engine.run(symbol=symbol, bars=test_slice, fold_k=fold.k)
         results.append(res)
+        pf = "∞" if math.isinf(res.profit_factor) else f"{res.profit_factor:.2f}"
         logger.info(
-            "Fold %d  bars=%d  trades=%d  gross=₹%.2f  net=₹%.2f  "
-            "sharpe=%.2f  dd=₹%.2f  win_rate=%.1f%%",
-            fold.k, res.n_bars, res.n_trades, res.gross_pnl, res.net_pnl,
-            res.sharpe, res.max_dd, res.win_rate * 100,
+            "Fold %d  bars=%d  trades=%d  net=₹%.2f  sharpe=%.2f  "
+            "dd=₹%.2f  win_rate=%.1f%%  pf=%s",
+            fold.k, res.n_bars, res.n_trades, res.net_pnl,
+            res.sharpe, res.max_dd, res.win_rate * 100, pf,
         )
     return results
 
@@ -400,16 +426,22 @@ def run_walk_forward(
 # ---------------------------------------------------------------------------
 def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="SentiStack walk-forward backtester")
-    p.add_argument("--symbol",    default="RELIANCE")
+    p.add_argument(
+        "--symbol",
+        default="RELIANCE",
+        help="Single symbol OR comma-separated list (e.g. RELIANCE,TCS,INFY)",
+    )
     p.add_argument("--start",     default="2025-01-06", help="YYYY-MM-DD (UTC)")
     p.add_argument("--end",       default="2025-01-31", help="YYYY-MM-DD (UTC)")
     p.add_argument("--interval",  default="minute")
     p.add_argument(
         "--strategy",
-        choices=["flat", "momentum"],
+        choices=["flat", "momentum", "live_risk"],
         default="momentum",
-        help="Scaffold strategy to exercise the engine end-to-end",
+        help="flat/momentum = scaffold; live_risk = real RiskManager adapter",
     )
+    p.add_argument("--capital", type=float, default=100_000.0,
+                   help="Starting capital for the live_risk adapter (₹)")
     p.add_argument("--n-splits",  type=int, default=5)
     p.add_argument(
         "--synthetic",
@@ -425,12 +457,34 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def _strategy_factory(kind: str) -> Callable[[], Strategy]:
+def _strategy_factory(kind: str, capital: float = 100_000.0) -> Callable[[], Strategy]:
     if kind == "flat":
         return lambda: DummyFlatStrategy()
     if kind == "momentum":
         return lambda: ScaffoldMomentumStrategy()
+    if kind == "live_risk":
+        # Late import so the base scaffold doesn't drag in the live
+        # RiskManager / GRI / config stack unless the user asks for it.
+        from .strategy_adapter import BacktestStrategyAdapter
+        return lambda: BacktestStrategyAdapter(capital=capital)
     raise ValueError(kind)
+
+
+def _load_or_synth(
+    symbol:    str,
+    start:     datetime,
+    end:       datetime,
+    interval:  str,
+    synthetic: bool,
+    base_price: float,
+) -> pd.DataFrame:
+    if synthetic:
+        return generate_synthetic_bars(symbol, start, end, interval=interval, base_price=base_price)
+    bars = load_bars(symbol, start, end, interval=interval)
+    if bars.empty:
+        logger.warning("No bars from live loader for %s — falling back to synthetic", symbol)
+        bars = generate_synthetic_bars(symbol, start, end, interval=interval, base_price=base_price)
+    return bars
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -440,60 +494,75 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     start = datetime.fromisoformat(args.start).replace(tzinfo=timezone.utc)
     end   = datetime.fromisoformat(args.end).replace(tzinfo=timezone.utc)
 
-    if args.synthetic:
-        bars = generate_synthetic_bars(
-            args.symbol, start, end,
-            interval=args.interval, base_price=args.base_price,
-        )
-    else:
-        bars = load_bars(args.symbol, start, end, interval=args.interval)
-        if bars.empty:
-            logger.warning(
-                "No bars from live loader — falling back to synthetic data "
-                "(install kiteconnect + set KITE_ACCESS_TOKEN for real data)"
-            )
-            bars = generate_synthetic_bars(
-                args.symbol, start, end,
-                interval=args.interval, base_price=args.base_price,
-            )
-
-    if bars.empty:
-        logger.error("No bars available — aborting")
+    symbols = [s.strip().upper() for s in args.symbol.split(",") if s.strip()]
+    if not symbols:
+        logger.error("No symbols supplied")
         return 1
 
-    logger.info("Loaded %d bars for %s (%s → %s)", len(bars), args.symbol, start.date(), end.date())
-
     splitter = PurgedWalkForward(n_splits=args.n_splits, embargo_pct=0.02)
-    results = run_walk_forward(
-        symbol=args.symbol,
-        bars=bars,
-        strategy_factory=_strategy_factory(args.strategy),
-        splitter=splitter,
-    )
+    factory  = _strategy_factory(args.strategy, capital=args.capital)
+
+    all_results: List[BacktestResult] = []
+    per_symbol_bars: dict[str, int]   = {}
+
+    for sym in symbols:
+        bars = _load_or_synth(sym, start, end, args.interval, args.synthetic, args.base_price)
+        if bars.empty:
+            logger.error("No bars for %s — skipping", sym)
+            continue
+        logger.info("Loaded %d bars for %s (%s → %s)", len(bars), sym, start.date(), end.date())
+        per_symbol_bars[sym] = len(bars)
+        results = run_walk_forward(
+            symbol=sym,
+            bars=bars,
+            strategy_factory=factory,
+            splitter=splitter,
+            product="MIS",
+        )
+        all_results.extend(results)
+
+    if not all_results:
+        logger.error("No results produced — aborting")
+        return 1
 
     # Aggregate summary
-    total_trades = sum(r.n_trades for r in results)
-    total_net    = sum(r.net_pnl  for r in results)
-    total_cost   = sum(r.total_costs for r in results)
-    total_gross  = sum(r.gross_pnl for r in results)
-    print("\n" + "=" * 60)
-    print(f"Backtest summary — {args.symbol} ({args.strategy} strategy, {args.n_splits} folds)")
-    print("=" * 60)
-    print(f"  total bars:    {len(bars):>10,}")
-    print(f"  total trades:  {total_trades:>10,}")
-    print(f"  gross P&L:     ₹{total_gross:>10,.2f}")
-    print(f"  total costs:   ₹{total_cost:>10,.2f}")
-    print(f"  net P&L:       ₹{total_net:>10,.2f}")
-    if results:
-        avg_sharpe = sum(r.sharpe for r in results) / len(results)
-        print(f"  avg sharpe:    {avg_sharpe:>10.3f}")
-    print("=" * 60)
+    total_trades = sum(r.n_trades for r in all_results)
+    total_net    = sum(r.net_pnl  for r in all_results)
+    total_cost   = sum(r.total_costs for r in all_results)
+    total_gross  = sum(r.gross_pnl for r in all_results)
+    gross_wins   = sum(r.net_pnl for r in all_results if r.net_pnl > 0)
+    gross_losses = sum(-r.net_pnl for r in all_results if r.net_pnl < 0)
+    if gross_losses > 0:
+        agg_pf = f"{gross_wins / gross_losses:.2f}"
+    elif gross_wins > 0:
+        agg_pf = "∞"
+    else:
+        agg_pf = "0.00"
+
+    total_bars = sum(per_symbol_bars.values())
+    print("\n" + "=" * 64)
+    print(
+        f"Backtest summary — {len(symbols)} symbol(s) "
+        f"[{args.strategy} strategy, {args.n_splits} folds]"
+    )
+    print("=" * 64)
+    print(f"  symbols:        {','.join(symbols)}")
+    print(f"  total bars:     {total_bars:>12,}")
+    print(f"  total trades:   {total_trades:>12,}")
+    print(f"  gross P&L:      ₹{total_gross:>12,.2f}")
+    print(f"  total costs:    ₹{total_cost:>12,.2f}")
+    print(f"  net P&L:        ₹{total_net:>12,.2f}")
+    print(f"  profit factor:  {agg_pf:>12}")
+    if all_results:
+        avg_sharpe = sum(r.sharpe for r in all_results) / len(all_results)
+        print(f"  avg sharpe:     {avg_sharpe:>12.3f}")
+    print("=" * 64)
 
     # Write CSV report
     from pathlib import Path
     report_path = Path(args.report_csv)
     report_path.parent.mkdir(parents=True, exist_ok=True)
-    df = pd.DataFrame([r.as_dict() for r in results])
+    df = pd.DataFrame([r.as_dict() for r in all_results])
     df.to_csv(report_path, index=False)
     print(f"Per-fold summary → {report_path}")
     return 0
