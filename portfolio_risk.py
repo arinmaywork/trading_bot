@@ -35,10 +35,10 @@ from __future__ import annotations
 
 import csv
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, date, time, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Mapping, Optional, Set, Tuple
 
 from config import settings
 
@@ -219,6 +219,120 @@ def _next_monday_915(now_ist: datetime) -> datetime:
 
 
 # ---------------------------------------------------------------------------
+# Task-5: sector map loader + exposure / MTM helpers
+# ---------------------------------------------------------------------------
+
+_SECTOR_MAP_CACHE: Optional[Dict[str, str]] = None
+_SECTOR_MAP_MTIME: float = 0.0
+_UNKNOWN_SECTOR = "Unknown"
+
+
+def _sector_map_path() -> Path:
+    """Resolve the sector map CSV relative to the project root."""
+    raw = settings.strategy.SECTOR_MAP_CSV
+    p = Path(raw)
+    if not p.is_absolute():
+        p = Path(__file__).parent / p
+    return p
+
+
+def load_sector_map(force_reload: bool = False) -> Dict[str, str]:
+    """
+    Read ``data/nse_sector_map.csv`` → ``{symbol: sector}``.
+
+    Cached on module load and auto-refreshed whenever the file's mtime
+    advances, so a running bot picks up sector edits without restart.
+    Returns an empty dict on read failure (caller falls back to the
+    ``Unknown`` bucket for every symbol).
+    """
+    global _SECTOR_MAP_CACHE, _SECTOR_MAP_MTIME
+    path = _sector_map_path()
+    if not path.exists():
+        if _SECTOR_MAP_CACHE is None:
+            logger.warning("sector map not found at %s — using 'Unknown' bucket", path)
+            _SECTOR_MAP_CACHE = {}
+        return _SECTOR_MAP_CACHE
+
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+
+    if (
+        not force_reload
+        and _SECTOR_MAP_CACHE is not None
+        and mtime == _SECTOR_MAP_MTIME
+    ):
+        return _SECTOR_MAP_CACHE
+
+    out: Dict[str, str] = {}
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                sym = (row.get("symbol") or "").strip().upper()
+                sec = (row.get("sector") or "").strip()
+                if sym and sec:
+                    out[sym] = sec
+    except Exception as exc:
+        logger.warning("sector map read failed (%s): %s", path.name, exc)
+        return _SECTOR_MAP_CACHE or {}
+
+    _SECTOR_MAP_CACHE = out
+    _SECTOR_MAP_MTIME = mtime
+    logger.info("Loaded %d symbols from sector map %s", len(out), path.name)
+    return out
+
+
+def sector_for(symbol: str) -> str:
+    """Lookup helper. Unknown symbols bucket into ``'Unknown'``."""
+    return load_sector_map().get(symbol.upper(), _UNKNOWN_SECTOR)
+
+
+def compute_sector_exposure(
+    positions: Mapping[str, int],
+    ltp_map:   Mapping[str, float],
+) -> Dict[str, float]:
+    """
+    Convert ``{symbol: net_qty}`` + ``{symbol: ltp}`` into
+    ``{sector: notional_₹}`` where notional = abs(qty) × ltp.
+
+    Shorts count toward the sector's gross exposure (``abs(qty)``) because
+    a correlated-sector crash hurts longs and shorts asymmetrically — a
+    single sector concentration is a problem either way.
+    """
+    out: Dict[str, float] = {}
+    for sym, qty in positions.items():
+        if not qty:
+            continue
+        ltp = float(ltp_map.get(sym, 0.0))
+        if ltp <= 0:
+            continue
+        sec   = sector_for(sym)
+        notl  = abs(int(qty)) * ltp
+        out[sec] = out.get(sec, 0.0) + notl
+    return out
+
+
+def compute_unrealised_pnl(
+    positions:      Mapping[str, int],
+    entry_prices:   Mapping[str, float],
+    ltp_map:        Mapping[str, float],
+) -> float:
+    """Sum of (ltp - entry) × qty across open positions (longs positive)."""
+    total = 0.0
+    for sym, qty in positions.items():
+        if not qty:
+            continue
+        ltp   = float(ltp_map.get(sym, 0.0))
+        entry = float(entry_prices.get(sym, 0.0))
+        if ltp <= 0 or entry <= 0:
+            continue
+        total += (ltp - entry) * int(qty)
+    return total
+
+
+# ---------------------------------------------------------------------------
 # Risk budget result
 # ---------------------------------------------------------------------------
 
@@ -231,9 +345,17 @@ class RiskBudget:
     week_limit_inr:  float
     month_limit_inr: float
     blacklisted:     Set[str]
-    halt_scope:      str       # "NONE" | "DAY" | "WEEK" | "MONTH"
+    halt_scope:      str       # "NONE" | "DAY" | "WEEK" | "MONTH" | "MTM"
     halt_reason:     str
     halt_until:      Optional[datetime]
+    # Task-5 additions — do NOT participate in the escalation scope rank;
+    # they are orthogonal guards that the strategy loop consults in parallel.
+    sector_exposure: Dict[str, float] = field(default_factory=dict)
+    sector_cap_inr:  float            = 0.0
+    sectors_blocked: Set[str]         = field(default_factory=set)
+    mtm_pnl:         float            = 0.0
+    mtm_limit_inr:   float            = 0.0
+    mtm_stop_active: bool             = False
 
     @property
     def day_used_pct(self) -> float:
@@ -268,16 +390,129 @@ class PortfolioRiskMonitor:
     def __init__(self, capital: float) -> None:
         self._capital = float(capital)
         self._last_check_ts: float = 0.0
+        # Task-5: intraday MTM stop latches to True the first time the stop
+        # fires each session. It resets at the next 09:15 IST open, the same
+        # way a DAY-window halt auto-lifts.
+        self._mtm_stop_latched_until: Optional[datetime] = None
 
     def update_capital(self, capital: float) -> None:
         if capital > 0:
             self._capital = float(capital)
 
+    # ── Task-5: sector exposure + MTM drawdown stop ──────────────────────
+
+    def evaluate_sector_exposure(
+        self,
+        positions: Mapping[str, int],
+        ltp_map:   Mapping[str, float],
+    ) -> Tuple[Dict[str, float], float, Set[str]]:
+        """
+        Returns (sector_exposure_₹, sector_cap_₹, blocked_sectors).
+
+        ``blocked_sectors`` is the set of sectors that are currently AT or
+        OVER the cap — new BUY entries in those sectors should be rejected
+        by the strategy loop's pre-trade check.
+        """
+        cfg = settings.strategy
+        exposure = compute_sector_exposure(positions, ltp_map)
+        cap_inr  = cfg.MAX_SECTOR_EXPOSURE_PCT * self._capital
+        if not cfg.SECTOR_CAP_ENABLED or cap_inr <= 0:
+            return exposure, cap_inr, set()
+        blocked = {s for s, notl in exposure.items() if notl >= cap_inr}
+        return exposure, cap_inr, blocked
+
+    def would_breach_sector_cap(
+        self,
+        symbol:         str,
+        additional_qty: int,
+        price:          float,
+        positions:      Mapping[str, int],
+        ltp_map:        Mapping[str, float],
+    ) -> Tuple[bool, str]:
+        """
+        Pre-trade check: would placing an ``additional_qty`` order for
+        ``symbol`` at ``price`` push its sector above the cap?
+
+        Returns ``(blocked, reason)`` — the strategy loop calls this BEFORE
+        the order is submitted. If the sector cap is disabled or capital is
+        not yet known, this is a no-op that always returns ``(False, "")``.
+        """
+        cfg = settings.strategy
+        if not cfg.SECTOR_CAP_ENABLED:
+            return False, ""
+        cap_inr = cfg.MAX_SECTOR_EXPOSURE_PCT * self._capital
+        if cap_inr <= 0 or price <= 0 or additional_qty <= 0:
+            return False, ""
+        sector    = sector_for(symbol)
+        existing  = compute_sector_exposure(positions, ltp_map)
+        current   = existing.get(sector, 0.0)
+        prospective = current + abs(int(additional_qty)) * float(price)
+        if prospective > cap_inr:
+            reason = (
+                f"Sector cap breach: {sector} would reach "
+                f"₹{prospective:,.0f} > ₹{cap_inr:,.0f} "
+                f"({cfg.MAX_SECTOR_EXPOSURE_PCT:.0%} of ₹{self._capital:,.0f})"
+            )
+            return True, reason
+        return False, ""
+
+    def evaluate_mtm_stop(
+        self,
+        realised_day_pnl: float,
+        unrealised_pnl:   float,
+        now_ist:          Optional[datetime] = None,
+    ) -> Tuple[float, float, bool, Optional[datetime]]:
+        """
+        Returns ``(mtm_pnl, mtm_limit_inr, stop_active, auto_clear_at)``.
+
+        ``mtm_pnl`` is realised + unrealised P&L for the session. Once it
+        crosses below the ``-INTRADAY_MTM_STOP_PCT × capital`` threshold the
+        stop latches ON and stays ON until the next session 09:15 IST, so a
+        brief mid-day rebound past the threshold does not re-enable entries.
+        """
+        cfg = settings.strategy
+        now_ist = now_ist or _ist_now()
+        mtm_pnl  = float(realised_day_pnl) + float(unrealised_pnl)
+        limit    = cfg.INTRADAY_MTM_STOP_PCT * self._capital
+
+        if not cfg.INTRADAY_MTM_STOP_ENABLED or limit <= 0:
+            # Disabled → report numbers for telemetry but never latch.
+            return mtm_pnl, limit, False, None
+
+        # Auto-clear at session rollover
+        if (
+            self._mtm_stop_latched_until is not None
+            and now_ist >= self._mtm_stop_latched_until
+        ):
+            self._mtm_stop_latched_until = None
+
+        # Latch when we first cross below the threshold
+        if mtm_pnl <= -limit and self._mtm_stop_latched_until is None:
+            self._mtm_stop_latched_until = _next_session_start(now_ist)
+            logger.warning(
+                "Task-5 MTM stop LATCHED: mtm=₹%+.0f ≤ -₹%.0f (%.1f%% of ₹%.0f). "
+                "Auto-clears at %s",
+                mtm_pnl, limit, cfg.INTRADAY_MTM_STOP_PCT * 100, self._capital,
+                self._mtm_stop_latched_until.strftime("%a %H:%M IST"),
+            )
+
+        stop_active = self._mtm_stop_latched_until is not None
+        return mtm_pnl, limit, stop_active, self._mtm_stop_latched_until
+
     # ── Core budget computation ──────────────────────────────────────────
 
-    def compute_budget(self, now_ist: Optional[datetime] = None) -> RiskBudget:
+    def compute_budget(
+        self,
+        now_ist:      Optional[datetime]       = None,
+        positions:    Optional[Mapping[str, int]]   = None,
+        ltp_map:      Optional[Mapping[str, float]] = None,
+        entry_prices: Optional[Mapping[str, float]] = None,
+    ) -> RiskBudget:
         now_ist = now_ist or _ist_now()
         cfg = settings.strategy
+        positions    = positions    or {}
+        ltp_map      = ltp_map      or {}
+        entry_prices = entry_prices or {}
 
         # Load trades for the three windows
         today_rows = _load_trades_for_day(now_ist.date())
@@ -346,6 +581,40 @@ class PortfolioRiskMonitor:
             )
             halt_until = _next_session_start(now_ist)
 
+        # Task-5: sector exposure snapshot (based on live open positions)
+        sector_exposure, sector_cap_inr, sectors_blocked = self.evaluate_sector_exposure(
+            positions=positions, ltp_map=ltp_map,
+        )
+
+        # Task-5: intraday MTM drawdown stop.
+        # realised_day_pnl is today's FIFO-matched net P&L from closed trades
+        # (what `day_pnl` already measures). Unrealised = open MTM from the
+        # current positions dict.
+        unrealised_pnl = compute_unrealised_pnl(
+            positions=positions, entry_prices=entry_prices, ltp_map=ltp_map,
+        )
+        mtm_pnl, mtm_limit_inr, mtm_stop_active, mtm_until = self.evaluate_mtm_stop(
+            realised_day_pnl = day_pnl,
+            unrealised_pnl   = unrealised_pnl,
+            now_ist          = now_ist,
+        )
+
+        # If MTM stop fires AND no stricter window halt is already active,
+        # promote the halt scope so `apply_to_state` will flip the entry
+        # guards. MTM slots between NONE and DAY in the escalation ladder:
+        # it blocks new entries but auto-clears at the next session, exactly
+        # like a DAY halt.
+        if mtm_stop_active and halt_scope == "NONE":
+            halt_scope  = "MTM"
+            halt_reason = (
+                f"Intraday MTM stop: realised₹{day_pnl:+,.0f} + "
+                f"unrealised₹{unrealised_pnl:+,.0f} = ₹{mtm_pnl:+,.0f} "
+                f"≤ -₹{mtm_limit_inr:,.0f} "
+                f"({cfg.INTRADAY_MTM_STOP_PCT:.1%} of ₹{self._capital:,.0f}). "
+                "Halted until next session 09:15 IST."
+            )
+            halt_until = mtm_until
+
         return RiskBudget(
             day_pnl         = day_pnl,
             week_pnl        = week_pnl,
@@ -357,6 +626,12 @@ class PortfolioRiskMonitor:
             halt_scope      = halt_scope,
             halt_reason     = halt_reason,
             halt_until      = halt_until,
+            sector_exposure = sector_exposure,
+            sector_cap_inr  = sector_cap_inr,
+            sectors_blocked = sectors_blocked,
+            mtm_pnl         = mtm_pnl,
+            mtm_limit_inr   = mtm_limit_inr,
+            mtm_stop_active = mtm_stop_active,
         )
 
     # ── State sync ────────────────────────────────────────────────────────
@@ -381,6 +656,20 @@ class PortfolioRiskMonitor:
         state.risk_blacklist   = budget.blacklisted
         state.risk_last_check  = _ist_now().strftime("%H:%M:%S")
 
+        # Task-5: always mirror the sector + MTM telemetry into state so the
+        # /risk command and strategy pre-trade checks can see them even when
+        # auto-halt is off.
+        try:
+            state.risk_sector_exposure = dict(budget.sector_exposure)
+            state.risk_sector_cap_inr  = budget.sector_cap_inr
+            state.risk_sector_blocked  = set(budget.sectors_blocked)
+            state.risk_mtm_pnl         = budget.mtm_pnl
+            state.risk_mtm_limit       = budget.mtm_limit_inr
+            state.risk_mtm_stop_active = budget.mtm_stop_active
+        except AttributeError:
+            # Older BotState without Task-5 fields — ignore silently.
+            pass
+
         if not cfg.RISK_ENABLE_AUTOHALT:
             # Dry-run mode: record numbers but do not set halt flags
             state.risk_halt_scope  = "NONE"
@@ -391,12 +680,12 @@ class PortfolioRiskMonitor:
         changed = False
         reason  = ""
 
-        # Auto-lift expired halts (day/week only)
+        # Auto-lift expired halts (MTM/day/week only — MONTH is manual)
         now = _ist_now()
         if (
             state.risk_halt_until is not None
             and now >= state.risk_halt_until
-            and state.risk_halt_scope in ("DAY", "WEEK")
+            and state.risk_halt_scope in ("MTM", "DAY", "WEEK")
             and budget.halt_scope == "NONE"
         ):
             state.risk_halt_scope  = "NONE"
@@ -407,8 +696,10 @@ class PortfolioRiskMonitor:
             changed = True
             reason  = f"Halt auto-lifted ({prev_scope} window expired)"
 
-        # New halt (escalation only — never downgrade until expiry)
-        scope_rank = {"NONE": 0, "DAY": 1, "WEEK": 2, "MONTH": 3}
+        # New halt (escalation only — never downgrade until expiry).
+        # MTM sits between NONE and DAY: it blocks new entries and auto-clears
+        # at the next session open, but any DAY/WEEK/MONTH halt supersedes it.
+        scope_rank = {"NONE": 0, "MTM": 1, "DAY": 2, "WEEK": 3, "MONTH": 4}
         if scope_rank[budget.halt_scope] > scope_rank[state.risk_halt_scope]:
             state.risk_halt_scope  = budget.halt_scope
             state.risk_halt_reason = budget.halt_reason
@@ -439,8 +730,18 @@ class PortfolioRiskMonitor:
 
     # ── Convenience: one-shot check returning both the budget & change ──
 
-    def check(self, state) -> Tuple[RiskBudget, bool, str]:
-        budget = self.compute_budget()
+    def check(
+        self,
+        state,
+        positions:    Optional[Mapping[str, int]]   = None,
+        ltp_map:      Optional[Mapping[str, float]] = None,
+        entry_prices: Optional[Mapping[str, float]] = None,
+    ) -> Tuple[RiskBudget, bool, str]:
+        budget = self.compute_budget(
+            positions    = positions,
+            ltp_map      = ltp_map,
+            entry_prices = entry_prices,
+        )
         changed, reason = self.apply_to_state(state, budget)
         return budget, changed, reason
 
@@ -479,6 +780,41 @@ def format_risk_report(state) -> str:
         if state.risk_blacklist else "🚷 Blacklisted today: none"
     )
 
+    # ── Task-5: Sector exposure panel ────────────────────────────────────
+    sector_exposure = getattr(state, "risk_sector_exposure", {}) or {}
+    sector_cap      = float(getattr(state, "risk_sector_cap_inr", 0.0) or 0.0)
+    sectors_blocked = getattr(state, "risk_sector_blocked", set()) or set()
+    if sector_exposure and sector_cap > 0:
+        rows = sorted(sector_exposure.items(), key=lambda kv: -kv[1])
+        lines = []
+        for sec, notl in rows[:8]:   # show top 8 sectors only
+            pct = min(1.0, max(0.0, notl / sector_cap))
+            marker = "⛔" if sec in sectors_blocked else "  "
+            lines.append(
+                f"{marker} {sec:<16} ₹{notl:>10,.0f}  "
+                f"<code>{_bar(pct, width=12)}</code> {pct:>4.0%}"
+            )
+        sector_panel = (
+            f"\n<b>Sector exposure</b> (cap ₹{sector_cap:,.0f} each)\n"
+            + "\n".join(lines)
+        )
+    else:
+        sector_panel = "\n<b>Sector exposure</b>: (none open)"
+
+    # ── Task-5: Intraday MTM panel ───────────────────────────────────────
+    mtm_pnl        = float(getattr(state, "risk_mtm_pnl",   0.0) or 0.0)
+    mtm_limit      = float(getattr(state, "risk_mtm_limit", 0.0) or 0.0)
+    mtm_active     = bool(getattr(state, "risk_mtm_stop_active", False))
+    if mtm_limit > 0:
+        mtm_pct = _pct(-mtm_pnl, mtm_limit)
+        mtm_flag = "🛑 LATCHED" if mtm_active else "✅ OK"
+        mtm_panel = (
+            f"\n<b>Intraday MTM</b>  ₹{mtm_pnl:+,.0f} / -₹{mtm_limit:,.0f}  {mtm_flag}\n"
+            f"  <code>{_bar(mtm_pct)}</code> {mtm_pct:>5.0%}"
+        )
+    else:
+        mtm_panel = ""
+
     return (
         "📊 <b>Portfolio Risk Budget</b>\n"
         f"{'─' * 32}\n"
@@ -491,7 +827,9 @@ def format_risk_report(state) -> str:
         f"  <code>{_bar(w_pct)}</code> {w_pct:>5.0%}\n"
         f"<b>Month</b>  ₹{state.risk_month_pnl:+,.0f} / "
         f"-₹{state.risk_month_limit:,.0f}\n"
-        f"  <code>{_bar(m_pct)}</code> {m_pct:>5.0%}\n\n"
+        f"  <code>{_bar(m_pct)}</code> {m_pct:>5.0%}"
+        f"{mtm_panel}\n"
+        f"{sector_panel}\n\n"
         f"{halt_line}\n"
         f"{blacklist_line}"
     )

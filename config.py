@@ -406,6 +406,30 @@ class StrategyConfig:
     CONFIDENCE_KELLY_TARGET:      float = 0.70   # Full Kelly at conf ≥ 0.70
     CONFIDENCE_KELLY_FLOOR:       float = 0.30   # Never shrink below 30% of computed Kelly
 
+    # ---------------------------------------------------------------------------
+    # Task-5: Sector correlation cap + intraday MTM drawdown stop
+    # ---------------------------------------------------------------------------
+    # Sector cap blocks new BUY entries whose addition would push the
+    # aggregate NOTIONAL in a sector above MAX_SECTOR_EXPOSURE_PCT × capital.
+    # The sector of a symbol is resolved via data/nse_sector_map.csv. Symbols
+    # not in the map are bucketed into "Unknown" and share a single quota.
+    #
+    # Intraday MTM stop halts new entries the moment (realised + unrealised)
+    # P&L crosses below INTRADAY_MTM_STOP_PCT × capital for the session. The
+    # halt auto-clears at the next trading-day 09:15 IST open, the same way
+    # DAY-window halts are lifted, so the operator never needs to /resume
+    # manually for pure intraday drawdowns.
+    SECTOR_CAP_ENABLED:       bool  = field(
+        default_factory=lambda: _optional("SECTOR_CAP_ENABLED", "true").lower() == "true"
+    )
+    MAX_SECTOR_EXPOSURE_PCT:  float = 0.30   # 30% of TOTAL_CAPITAL per sector
+    SECTOR_MAP_CSV:           str   = "data/nse_sector_map.csv"
+
+    INTRADAY_MTM_STOP_ENABLED: bool  = field(
+        default_factory=lambda: _optional("INTRADAY_MTM_STOP_ENABLED", "true").lower() == "true"
+    )
+    INTRADAY_MTM_STOP_PCT:    float = 0.015  # -1.5% of capital (stricter than DAY)
+
 
 # ---------------------------------------------------------------------------
 # Logging

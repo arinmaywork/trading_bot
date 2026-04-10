@@ -331,6 +331,10 @@ python main.py
 | `BOOTSTRAP_CAPITAL_THRESHOLD` | — | INR cap below which bootstrap sizing activates. Default `50000` |
 | `ADAPTIVE_ALPHA_ENABLED` | — | Task-4: rolling 90th-percentile alpha gate per symbol (200-bar window, 30-bar warmup to static `MIN_ALPHA_THRESHOLD`). Default `true` |
 | `CONFIDENCE_KELLY_ENABLED` | — | Task-4: haircut Kelly fraction by `min(1, conf/0.70)` floored at `0.30`. Default `true` |
+| `SECTOR_CAP_ENABLED` | — | Task-5: block new BUY entries that would push any sector above `MAX_SECTOR_EXPOSURE_PCT` of capital. Uses `data/nse_sector_map.csv`. Default `true` |
+| `MAX_SECTOR_EXPOSURE_PCT` | — | Task-5: max gross exposure per sector. Default `0.30` (30% of capital) |
+| `INTRADAY_MTM_STOP_ENABLED` | — | Task-5: halt new entries when (realised + unrealised) ≤ −`INTRADAY_MTM_STOP_PCT` × capital. Latches until next session 09:15 IST. Default `true` |
+| `INTRADAY_MTM_STOP_PCT` | — | Task-5: intraday MTM drawdown threshold. Default `0.015` (−1.5% of capital) |
 
 ---
 

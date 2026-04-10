@@ -536,6 +536,7 @@ async def strategy_loop(
         risk_last_mono: float = 0.0      # R-13 throttle
         margin_last_mono: float = 0.0    # R-14 throttle
         margin_seeded: bool = False      # R-14 first-poll flag
+        last_ltp_map: Dict[str, float] = {}   # Task-5: previous-cycle LTP snapshot
     _strategy_loop_state = _LoopState()
 
     while True:
@@ -656,7 +657,19 @@ async def strategy_loop(
             _now_mono = time.monotonic()
             if (_now_mono - _strategy_loop_state.risk_last_mono) >= _risk_interval:
                 try:
-                    _budget, _changed, _reason = portfolio_risk.check(bot_state)
+                    # Task-5: pass live position snapshot + last-cycle LTP
+                    # snapshot so the monitor can compute sector exposure and
+                    # intraday MTM. On the very first cycle these will be empty
+                    # which is harmless (just reports 0 exposure / 0 MTM).
+                    _pr_positions = pos_manager.snapshot_positions()
+                    _pr_entries   = pos_manager.snapshot_entry_prices()
+                    _pr_ltp       = _strategy_loop_state.last_ltp_map
+                    _budget, _changed, _reason = portfolio_risk.check(
+                        bot_state,
+                        positions    = _pr_positions,
+                        ltp_map      = _pr_ltp,
+                        entry_prices = _pr_entries,
+                    )
                     _strategy_loop_state.risk_last_mono = _now_mono
                     if _changed and _reason:
                         logger.warning("R-13 RISK HALT TRANSITION: %s", _reason)
@@ -709,6 +722,9 @@ async def strategy_loop(
                 )
             for k, v in raw_ltp.items():
                 ltp_map[k.split(":")[1]] = float(v["last_price"])
+
+            # Task-5: cache for next cycle's portfolio-risk check
+            _strategy_loop_state.last_ltp_map = dict(ltp_map)
 
             # Diagnostic: log LTP health every 10 cycles
             priced = sum(1 for p in ltp_map.values() if p > 0)
@@ -1097,6 +1113,36 @@ async def strategy_loop(
                             symbol, net_qty,
                         )
                         continue
+
+                    # ── Task-5: Sector correlation cap (BUY entries only) ───
+                    # Block new longs that would push a sector above the cap.
+                    # Shorts are left to the separate gross-exposure monitoring
+                    # because the strategy's primary book is long-biased.
+                    if (portfolio_risk is not None
+                            and sig.direction == TradeDirection.BUY
+                            and sig.quantity > 0):
+                        try:
+                            _blocked, _sc_reason = portfolio_risk.would_breach_sector_cap(
+                                symbol         = symbol,
+                                additional_qty = int(sig.quantity),
+                                price          = float(price),
+                                positions      = pos_manager.snapshot_positions(),
+                                ltp_map        = ltp_map,
+                            )
+                        except Exception as _sc_exc:
+                            logger.warning("Sector cap check failed (%s) — allowing trade", _sc_exc)
+                            _blocked = False
+                            _sc_reason = ""
+                        if _blocked:
+                            logger.warning("Task-5 SECTOR CAP: %s", _sc_reason)
+                            try:
+                                await telegram.send_message(
+                                    f"⛔ <b>Sector cap block</b>\n{_sc_reason}\n"
+                                    f"Skipped BUY {sig.quantity}×{symbol}"
+                                )
+                            except Exception:
+                                pass
+                            continue
 
                     logger.info(
                         "Signal -> %s %s qty=%d alpha=%.5f",

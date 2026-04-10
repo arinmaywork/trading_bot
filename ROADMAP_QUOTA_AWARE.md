@@ -113,7 +113,7 @@ stop at the next pause checkpoint, commit WIP, and resume later.
 
 ---
 
-### Task 5 — Sector correlation cap + intraday MTM drawdown stop
+### Task 5 — Sector correlation cap + intraday MTM drawdown stop ✅ COMPLETE
 **Scope:**
 - Extend `portfolio_risk.py`: sector map from `data/nse_sector_map.csv`; max 30% per sector.
 - Intraday MTM stop: unrealized + realized < -1.5% capital → halt new entries, auto-clear next open.
@@ -230,7 +230,7 @@ If any session hits the quota warning:
 - [x] Task 2 — Backtester scaffold
 - [x] Task 3 — Backtester strategy adapter
 - [x] Task 4 — Alpha threshold + confidence Kelly
-- [ ] Task 5 — Sector cap + MTM stop
+- [x] Task 5 — Sector cap + MTM stop
 - [ ] Task 6 — Passive limit orders
 - [ ] Task 7 — Slippage monitor + daily digest
 - [ ] Task 8 — Cost fidelity (R-16)

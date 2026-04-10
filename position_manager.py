@@ -233,3 +233,16 @@ class PositionManager:
     @property
     def active_symbols(self) -> List[str]:
         return list(self._positions.keys())
+
+    # ── Task-5 helpers: snapshot open positions for portfolio_risk ──────
+    def snapshot_positions(self) -> Dict[str, int]:
+        """``{symbol: signed_qty}`` where BUY is positive, SELL is negative."""
+        out: Dict[str, int] = {}
+        for sym, pos in self._positions.items():
+            sign = 1 if pos.direction == TradeDirection.BUY else -1
+            out[sym] = sign * int(pos.quantity)
+        return out
+
+    def snapshot_entry_prices(self) -> Dict[str, float]:
+        """``{symbol: entry_price}`` for computing unrealised MTM."""
+        return {sym: float(pos.entry_price) for sym, pos in self._positions.items()}

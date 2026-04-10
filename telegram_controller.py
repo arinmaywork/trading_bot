@@ -130,6 +130,13 @@ class BotState:
     risk_month_limit: float      = 0.0
     risk_blacklist:   set        = field(default_factory=set)  # symbols halted today
     risk_last_check:  str        = ""
+    # ── Task-5: Sector exposure + intraday MTM drawdown stop ────────────
+    risk_sector_exposure: dict   = field(default_factory=dict)  # sector -> ₹ notional
+    risk_sector_cap_inr:  float  = 0.0      # absolute ₹ per-sector cap (cached)
+    risk_sector_blocked:  set    = field(default_factory=set)   # sectors at/over cap
+    risk_mtm_pnl:         float  = 0.0      # realised + unrealised (₹)
+    risk_mtm_limit:       float  = 0.0      # absolute ₹ stop (INTRADAY_MTM_STOP_PCT × cap)
+    risk_mtm_stop_active: bool   = False    # True while intraday MTM stop is firing
     # ── R-15: Runtime paper-trade toggle arming (60-sec confirm window) ──
     live_mode_arm_until: Optional[datetime] = None
     # ── Task health — updated by each background task every cycle ────────
