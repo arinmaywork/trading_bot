@@ -195,6 +195,43 @@ cycle, so your risk limits always move with your actual account size.
 **Paper mode:** Auto-sync is deliberately disabled. Paper capital is whatever
 you set via `/capital` or `TOTAL_CAPITAL` — there is no real broker to poll.
 
+### Bootstrap mode for small accounts (Task-1)
+
+The default risk envelope — `MAX_POSITION_FRACTION = 5%` and
+`MIN_TRADE_VALUE = ₹2000` — is calibrated for accounts of ₹1 lakh or
+more. At ₹5-10 k starting capital the R-10 cost filter rejects every
+signal because the Kelly-sized quantity cannot reach the ₹2000
+notional floor that keeps brokerage under 2% of expected P&L.
+
+**Bootstrap mode** flips both knobs while the active capital is below a
+threshold so the small-capital validation phase can actually trade:
+
+| Knob | Normal | Bootstrap |
+|---|---|---|
+| Max position fraction | 5% | 35% |
+| Min trade value | ₹2000 | ₹500 |
+| Capital threshold | — | ₹50,000 (configurable) |
+
+The switch is **automatic**. Every sizing decision reads the active
+capital (`BotState.paper_capital`) and picks the right envelope via
+`get_effective_position_fraction()` / `get_effective_min_trade_value()`
+in `config.py`. The moment the account grows past
+`BOOTSTRAP_CAPITAL_THRESHOLD` the bot reverts to normal sizing on the
+next trade — no restart, no command.
+
+**Controls:**
+- `.env`: `BOOTSTRAP_MODE=true` (default), `BOOTSTRAP_CAPITAL_THRESHOLD=50000`
+- Telegram `/status` shows a `🚀 Bootstrap:` line indicating ON/OFF
+  plus the active fraction and min trade value.
+
+**⚠️ Warning.** Bootstrap sizing is intentionally aggressive. A 35% per-position
+cap means two bad trades can consume most of a ₹5k account. Treat
+bootstrap mode as validation only — it exists so you can confirm
+signals are firing and orders are placing correctly, not as a
+steady-state operating envelope. The right answer to "I want more
+positions and smaller drawdowns" is to raise capital past the
+threshold, not to raise bootstrap sizing itself.
+
 ### Paper ↔ Live toggle (R-15)
 
 The `PAPER_TRADE` env var sets the mode at startup, but you can flip it
@@ -290,6 +327,8 @@ python main.py
 | `MIN_TRADE_VALUE` | — | Default `2000` INR |
 | `AUTO_SYNC_CAPITAL` | — | `true` to auto-sync capital from Zerodha balance every 5 min (live mode only) |
 | `AUTO_SYNC_MAX_CAPITAL` | — | Hard ceiling on auto-synced capital (INR). Default `10000000` (₹1 Cr) |
+| `BOOTSTRAP_MODE` | — | `true` to auto-apply small-capital sizing when active capital is below threshold. Default `true` |
+| `BOOTSTRAP_CAPITAL_THRESHOLD` | — | INR cap below which bootstrap sizing activates. Default `50000` |
 
 ---
 

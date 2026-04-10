@@ -342,6 +342,36 @@ class StrategyConfig:
         default_factory=lambda: float(_optional("AUTO_SYNC_MAX_CAPITAL", "10000000"))
     )   # hard ceiling even if broker balance > this (₹1 crore default)
 
+    # ---------------------------------------------------------------------------
+    # Task-1: BOOTSTRAP_MODE — small-capital operating envelope
+    # ---------------------------------------------------------------------------
+    # Rationale: the default risk envelope (MAX_POSITION_FRACTION=0.05,
+    # MIN_TRADE_VALUE=₹2000) was sized for a ≥ ₹100 k account. At ₹5-10 k of
+    # starting capital every single trade gets rejected by the R-10 cost filter
+    # because the Kelly-sized qty can't clear ₹2000 in order value.
+    #
+    # Bootstrap mode relaxes both knobs while the active capital is below
+    # BOOTSTRAP_CAPITAL_THRESHOLD, so the bot can actually take trades during
+    # the small-capital validation phase. It auto-reverts the moment the
+    # active capital grows past the threshold — no manual flip required.
+    #
+    #   BOOTSTRAP_MODE                     : master enable switch (default on)
+    #   BOOTSTRAP_CAPITAL_THRESHOLD        : cap below which bootstrap applies
+    #   BOOTSTRAP_MAX_POSITION_FRACTION    : bigger per-name sizing (0.35)
+    #   BOOTSTRAP_MIN_TRADE_VALUE          : lower notional floor (₹500)
+    #
+    # IMPORTANT: bootstrap sizing is intentionally aggressive. Do NOT raise
+    # BOOTSTRAP_CAPITAL_THRESHOLD without also lowering the fraction — a 35%
+    # per-position cap on a ₹1L account is a recipe for blow-up.
+    BOOTSTRAP_MODE:                  bool  = field(
+        default_factory=lambda: _optional("BOOTSTRAP_MODE", "true").lower() == "true"
+    )
+    BOOTSTRAP_CAPITAL_THRESHOLD:     float = field(
+        default_factory=lambda: float(_optional("BOOTSTRAP_CAPITAL_THRESHOLD", "50000"))
+    )
+    BOOTSTRAP_MAX_POSITION_FRACTION: float = 0.35
+    BOOTSTRAP_MIN_TRADE_VALUE:       float = 500.0
+
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -409,3 +439,49 @@ def set_paper_trade_override(value: Optional[bool]) -> None:
     """
     global _PAPER_TRADE_OVERRIDE
     _PAPER_TRADE_OVERRIDE = value
+
+
+# ---------------------------------------------------------------------------
+# Task-1: BOOTSTRAP_MODE effective-sizing helpers
+# ---------------------------------------------------------------------------
+# These are the ONLY places in the codebase that should decide which sizing
+# knob is active. Every call site that used to read
+#   settings.strategy.MAX_POSITION_FRACTION
+#   settings.strategy.MIN_TRADE_VALUE
+# directly must route through one of these helpers, passing the currently-
+# active capital. Because capital can change at runtime (via /capital,
+# /synccapital, or R-14 auto-sync), the answer is capital-dependent and must
+# be recomputed on each trade decision rather than cached at startup.
+
+def is_bootstrap_active(capital: float) -> bool:
+    """True iff bootstrap mode is enabled AND active capital is below the threshold."""
+    s = settings.strategy
+    if not s.BOOTSTRAP_MODE:
+        return False
+    return capital < s.BOOTSTRAP_CAPITAL_THRESHOLD
+
+
+def get_effective_position_fraction(capital: float) -> float:
+    """
+    Return the max-position fraction that should apply at the given capital.
+
+    Bootstrap: BOOTSTRAP_MAX_POSITION_FRACTION (0.35 default)
+    Normal:    MAX_POSITION_FRACTION (0.05 default)
+    """
+    s = settings.strategy
+    if is_bootstrap_active(capital):
+        return s.BOOTSTRAP_MAX_POSITION_FRACTION
+    return s.MAX_POSITION_FRACTION
+
+
+def get_effective_min_trade_value(capital: float) -> float:
+    """
+    Return the minimum trade notional (INR) that should apply at the given capital.
+
+    Bootstrap: BOOTSTRAP_MIN_TRADE_VALUE (₹500 default)
+    Normal:    MIN_TRADE_VALUE (₹2000 default)
+    """
+    s = settings.strategy
+    if is_bootstrap_active(capital):
+        return s.BOOTSTRAP_MIN_TRADE_VALUE
+    return s.MIN_TRADE_VALUE

@@ -320,6 +320,22 @@ class TelegramController:
             trade_mode_str = "📝 PAPER (simulated)" if _ipt() else "💸 LIVE (real money)"
         except Exception:
             trade_mode_str = "?"
+        # Task-1: surface bootstrap-mode state (active iff capital < threshold)
+        try:
+            from config import (
+                is_bootstrap_active as _iba,
+                get_effective_position_fraction as _gpf,
+                get_effective_min_trade_value as _gmtv,
+            )
+            if _iba(s.paper_capital):
+                bootstrap_str = (
+                    f"🚀 ON (frac={_gpf(s.paper_capital):.0%}, "
+                    f"min=₹{_gmtv(s.paper_capital):.0f})"
+                )
+            else:
+                bootstrap_str = "💤 OFF (normal sizing)"
+        except Exception:
+            bootstrap_str = "?"
         gri_emoji  = "🟢" if s.last_gri < 0.30 else ("🟡" if s.last_gri < 0.50 else "🔴")
         sent_emoji = {"Fear": "😨", "Excitement": "🚀", "Neutral": "😐"}.get(
             s.last_sentiment_class, "😐"
@@ -346,6 +362,7 @@ class TelegramController:
             f"{'─' * 34}\n"
             f"⚙️ <b>Mode:</b>        {mode_labels[s.mode]}\n"
             f"💹 <b>Trading:</b>     {trade_mode_str}\n"
+            f"🚀 <b>Bootstrap:</b>   {bootstrap_str}\n"
             f"🎮 <b>State:</b>       {paused_str}\n"
             f"🔢 <b>Universe:</b>    {s.active_symbols} symbols\n"
             f"🏆 <b>Top 3:</b>       {top}\n"

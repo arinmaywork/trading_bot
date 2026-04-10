@@ -50,7 +50,11 @@ import numpy as np
 import redis.asyncio as aioredis
 
 from alternative_data import SentimentResult
-from config import settings
+from config import (
+    settings,
+    get_effective_position_fraction,
+    get_effective_min_trade_value,
+)
 from data_ingestion import (
     get_latest_mlofi, get_latest_ofi, get_aggressive_flow, CandleAggregator
 )
@@ -421,6 +425,13 @@ class RiskManager:
         _SIGNAL_SCALE = getattr(settings.ml, "SIGNAL_SCALE", 20.0)
         mu            = abs(float(ml_signal)) / max(_SIGNAL_SCALE, 1.0)
 
+        # Task-1: resolve effective sizing knobs against the active capital.
+        # Bootstrap mode unlocks a larger per-position fraction while the
+        # account is still small (< BOOTSTRAP_CAPITAL_THRESHOLD), and auto-
+        # reverts to the normal fraction the moment capital grows past it.
+        eff_max_frac      = get_effective_position_fraction(self._capital)
+        eff_min_trade_val = get_effective_min_trade_value(self._capital)
+
         # Log-optimal Kelly
         f_kelly = mu / (sigma_bar ** 2) if sigma_bar > 0 else 0.0
         # Busseti parametric VaR cap
@@ -430,9 +441,9 @@ class RiskManager:
         else:
             # μ > z·σ → signal edge dominates noise at the 5% VaR level;
             # VaR constraint is not binding. Fall back to the position cap.
-            f_var_cap = self._cfg.MAX_POSITION_FRACTION * 2.0
+            f_var_cap = eff_max_frac * 2.0
 
-        f_param = min(f_kelly, f_var_cap, self._cfg.MAX_POSITION_FRACTION * 2.0)
+        f_param = min(f_kelly, f_var_cap, eff_max_frac * 2.0)
         # Apply fractional-Kelly haircut (safety: never sit at full Kelly live)
         f_param *= self._cfg.KELLY_FRACTION
 
@@ -447,7 +458,7 @@ class RiskManager:
                 returns = pnl_dist,
                 epsilon = self.BUSSETI_EPSILON,
                 w_floor = self.BUSSETI_W_FLOOR,
-                f_max   = self._cfg.MAX_POSITION_FRACTION * 2.0,
+                f_max   = eff_max_frac * 2.0,
                 n_iters = self.BISECTION_ITERS,
             )
             f_busseti = min(f_param, f_empirical)
@@ -468,7 +479,7 @@ class RiskManager:
         f_geo  = f_busseti * gri.kelly_multiplier
 
         # GRI position cap tightening (Layer 3)
-        geo_cap = gri.max_position_fraction_cap(self._cfg.MAX_POSITION_FRACTION)
+        geo_cap = gri.max_position_fraction_cap(eff_max_frac)
         f_final = min(f_geo, geo_cap)
 
         if f_final <= 0:
@@ -503,10 +514,11 @@ class RiskManager:
             # R-12: Safety margin — profit should be at least 2.0x the round-trip cost
             # to account for slippage and execution latency.
             if exp_pl < 2.0 * cost:
-                # Kelly qty is too small — try bumping up to MIN_TRADE_VALUE
-                min_qty = math.ceil(cfg_costs.MIN_TRADE_VALUE / current_price)
+                # Kelly qty is too small — try bumping up to effective MIN_TRADE_VALUE
+                # (Task-1: bootstrap mode lowers this for small accounts)
+                min_qty = math.ceil(eff_min_trade_val / current_price)
                 min_qty = max(min_qty, final)
-                max_allowed = int(cfg_costs.MAX_POSITION_FRACTION * self._capital / current_price)
+                max_allowed = int(eff_max_frac * self._capital / current_price)
                 if min_qty <= max_allowed and _expected_pnl(min_qty) > 2.0 * _round_trip_cost(min_qty):
                     logger.info(
                         "CostFilter %s: bumping qty %d→%d to clear 2x brokerage hurdle "
@@ -519,7 +531,7 @@ class RiskManager:
                         "CostFilter %s: SKIPPING TRADE — exp_pnl=₹%.2f < 2x cost=₹%.2f "
                         "(brokerage+STT hurdle not cleared even at min_trade_value=₹%.0f). "
                         "Tip: increase capital or wait for a stronger signal.",
-                        symbol, exp_pl, cost, cfg_costs.MIN_TRADE_VALUE,
+                        symbol, exp_pl, cost, eff_min_trade_val,
                     )
                     return 0, f_final, f_busseti, False, (
                         f"Trade cost ₹{cost:.2f} too high vs exp P&L ₹{exp_pl:.2f} (2x hurdle) — "
