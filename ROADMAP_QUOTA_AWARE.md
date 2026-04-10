@@ -227,7 +227,7 @@ If any session hits the quota warning:
 ## Task status
 
 - [x] Task 1 — BOOTSTRAP_MODE
-- [ ] Task 2 — Backtester scaffold
+- [x] Task 2 — Backtester scaffold
 - [ ] Task 3 — Backtester strategy adapter
 - [ ] Task 4 — Alpha threshold + confidence Kelly
 - [ ] Task 5 — Sector cap + MTM stop

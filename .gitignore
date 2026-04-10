@@ -11,3 +11,8 @@ logs/
 *.sh.env
 .env.sh
 .gemini_quota.json
+
+# Task 2: backtester cache and per-run reports
+backtest/cache/
+backtest/reports/
+!backtest/reports/.gitkeep
