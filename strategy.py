@@ -329,6 +329,60 @@ class RiskManager:
         self._capital        = capital
         self._cfg            = settings.strategy
         self._baseline_vols: Dict[str, float] = {}
+        # Task-4: per-symbol rolling |ml_signal| buffer for the self-calibrating
+        # alpha threshold. A plain deque is fine — we only need to compute a
+        # percentile on-demand when a new signal arrives, not on every bar.
+        from collections import deque  # local import: keeps module import cheap
+        self._alpha_window: Dict[str, "deque[float]"] = {}
+        self._deque_maker  = deque
+
+    # ------------------------------------------------------------------
+    # Task-4: adaptive alpha threshold helpers
+    # ------------------------------------------------------------------
+    def _record_alpha(self, symbol: str, ml_signal: float) -> None:
+        """Push a new |ml_signal| observation into the rolling window."""
+        if not self._cfg.ADAPTIVE_ALPHA_ENABLED:
+            return
+        buf = self._alpha_window.get(symbol)
+        if buf is None:
+            buf = self._deque_maker(maxlen=self._cfg.ALPHA_PERCENTILE_WINDOW)
+            self._alpha_window[symbol] = buf
+        buf.append(abs(float(ml_signal)))
+
+    def _effective_alpha_threshold(self, symbol: str) -> Tuple[float, str]:
+        """
+        Return the active alpha gate for a symbol.
+
+        If adaptive mode is off, or we haven't seen enough observations yet,
+        fall back to the static ``MIN_ALPHA_THRESHOLD``. Otherwise return the
+        rolling ``ALPHA_PERCENTILE`` of recent |ml_signal|, floored at the
+        static minimum so a degenerate all-zero window never opens the gate.
+        """
+        static_th = self._cfg.MIN_ALPHA_THRESHOLD
+        if not self._cfg.ADAPTIVE_ALPHA_ENABLED:
+            return static_th, "static"
+        buf = self._alpha_window.get(symbol)
+        if buf is None or len(buf) < self._cfg.ALPHA_MIN_OBSERVATIONS:
+            return static_th, f"static (warmup {len(buf) if buf else 0}/{self._cfg.ALPHA_MIN_OBSERVATIONS})"
+        # Percentile without numpy dependency (deque is small, sort is cheap).
+        sorted_buf = sorted(buf)
+        n          = len(sorted_buf)
+        idx        = min(int(self._cfg.ALPHA_PERCENTILE * n), n - 1)
+        percentile_val = sorted_buf[idx]
+        floor          = static_th * self._cfg.ALPHA_ADAPTIVE_FLOOR_MULT
+        effective      = max(percentile_val, floor)
+        return effective, f"p{int(self._cfg.ALPHA_PERCENTILE * 100)}(n={n})={percentile_val:.5f}"
+
+    def _confidence_kelly_multiplier(self, ml_confidence: float) -> float:
+        """
+        Task-4: haircut the Kelly fraction by ``min(1, conf/target)`` with a
+        floor so weak-but-valid signals still receive SOME capital.
+        """
+        if not self._cfg.CONFIDENCE_KELLY_ENABLED:
+            return 1.0
+        target = max(self._cfg.CONFIDENCE_KELLY_TARGET, 1e-6)
+        raw    = ml_confidence / target
+        return max(self._cfg.CONFIDENCE_KELLY_FLOOR, min(1.0, raw))
 
     def update_capital(self, capital: float) -> None:
         """Update the trading capital used for position sizing."""
@@ -367,6 +421,7 @@ class RiskManager:
         vol:           float,
         gri:           GeopoliticalRiskIndex,
         redis_client:  aioredis.Redis,
+        ml_confidence: float = 1.0,
     ) -> Tuple[int, float, float, bool, str]:
         """
         Full Busseti + GRI position sizing.
@@ -385,8 +440,17 @@ class RiskManager:
             logger.warning("RiskManager DECAY %s: %s", symbol, reason)
             return 0, 0.0, 0.0, True, reason
 
-        if abs(ml_signal) < self._cfg.MIN_ALPHA_THRESHOLD:
-            return 0, 0.0, 0.0, False, f"Signal below threshold: {ml_signal:.6f}"
+        # Task-4: self-calibrating alpha threshold. Record every incoming
+        # signal into the rolling window FIRST so the distribution tracks
+        # reality (even signals that end up getting rejected by the gate),
+        # then compare against the effective percentile threshold.
+        self._record_alpha(symbol, ml_signal)
+        alpha_gate, alpha_source = self._effective_alpha_threshold(symbol)
+        if abs(ml_signal) < alpha_gate:
+            return 0, 0.0, 0.0, False, (
+                f"Signal below adaptive threshold: "
+                f"|{ml_signal:.6f}| < {alpha_gate:.6f} [{alpha_source}]"
+            )
 
         # ── FIX (Bug 2.1): Parametric Kelly + Busseti VaR constraint ──
         #
@@ -446,6 +510,10 @@ class RiskManager:
         f_param = min(f_kelly, f_var_cap, eff_max_frac * 2.0)
         # Apply fractional-Kelly haircut (safety: never sit at full Kelly live)
         f_param *= self._cfg.KELLY_FRACTION
+        # Task-4: confidence-weighted Kelly — scale down the fraction when the
+        # ensemble's model-agreement confidence is below CONFIDENCE_KELLY_TARGET.
+        conf_mult = self._confidence_kelly_multiplier(ml_confidence)
+        f_param  *= conf_mult
 
         # Secondary empirical cap from conditional return distribution
         raw_returns = await get_return_distribution(redis_client, symbol)
@@ -464,14 +532,18 @@ class RiskManager:
             f_busseti = min(f_param, f_empirical)
             method = (
                 f"ParamKelly(μ={mu:.5f}, σ={sigma_bar:.5f}, "
-                f"f_k={f_kelly:.4f}, f_var={f_var_cap:.4f}) "
+                f"f_k={f_kelly:.4f}, f_var={f_var_cap:.4f}, "
+                f"conf={ml_confidence:.2f}×{conf_mult:.2f}, "
+                f"αgate={alpha_gate:.5f}[{alpha_source}]) "
                 f"∩ Empirical(n={len(raw_returns)}, f={f_empirical:.4f})"
             )
         else:
             f_busseti = f_param
             method = (
                 f"ParamKelly(μ={mu:.5f}, σ={sigma_bar:.5f}, "
-                f"f_k={f_kelly:.4f}, f_var={f_var_cap:.4f}) "
+                f"f_k={f_kelly:.4f}, f_var={f_var_cap:.4f}, "
+                f"conf={ml_confidence:.2f}×{conf_mult:.2f}, "
+                f"αgate={alpha_gate:.5f}[{alpha_source}]) "
                 f"[no empirical tail cap — insufficient labelled data]"
             )
 
@@ -678,6 +750,7 @@ class StrategyEngine:
                 vol           = vol,
                 gri           = gri,
                 redis_client  = self._redis,
+                ml_confidence = signal_out.confidence,
             )
         )
 

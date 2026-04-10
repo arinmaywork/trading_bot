@@ -193,13 +193,21 @@ class _TechnicalSignal:
     def ready(self) -> bool:
         return len(self._closes) >= self.long_win
 
-    def signal_and_vol(self) -> Tuple[float, float]:
+    def signal_and_vol(self) -> Tuple[float, float, float]:
+        """Return ``(ml_signal, vol_ann, ml_confidence)``.
+
+        The confidence proxy is the |t-statistic| of the short-window mean
+        return, passed through ``min(1, t/2)``: a t of 0 gives 0 confidence,
+        t of 2 → full confidence (roughly a one-sided 95% edge).  Task 4's
+        confidence-weighted Kelly uses this to haircut weak signals below
+        its floor.
+        """
         closes = np.asarray(self._closes, dtype=float)
         if len(closes) < self.short_win + 2:
-            return 0.0, 0.0
+            return 0.0, 0.0, 0.0
         log_rets = np.diff(np.log(closes))
         if len(log_rets) < self.short_win:
-            return 0.0, 0.0
+            return 0.0, 0.0, 0.0
         recent  = log_rets[-self.short_win:]
         mu_1bar = float(np.mean(recent))
         ml_signal = mu_1bar * self._signal_scale
@@ -210,9 +218,19 @@ class _TechnicalSignal:
             sigma_bar = float(np.std(baseline, ddof=1))
         else:
             sigma_bar = 0.0
-        # Convert per-bar σ to annualised σ (NSE: 252 × 375 minute bars)
         vol_ann = sigma_bar * math.sqrt(252 * 375) if sigma_bar > 0 else 0.0
-        return ml_signal, vol_ann
+
+        # t-stat of the short-window mean → confidence proxy
+        if sigma_bar > 0 and len(recent) > 1:
+            short_sigma = float(np.std(recent, ddof=1))
+            if short_sigma > 0:
+                t_stat = abs(mu_1bar) / (short_sigma / math.sqrt(len(recent)))
+                confidence = max(0.0, min(1.0, t_stat / 2.0))
+            else:
+                confidence = 0.0
+        else:
+            confidence = 0.0
+        return ml_signal, vol_ann, confidence
 
 
 # ---------------------------------------------------------------------------
@@ -285,7 +303,7 @@ class BacktestStrategyAdapter:
         ):
             return None
 
-        ml_signal, vol_ann = self._signal.signal_and_vol()
+        ml_signal, vol_ann, ml_conf = self._signal.signal_and_vol()
 
         # Position-management path: exit on sign flip
         if self._open_qty > 0 and ml_signal < 0:
@@ -294,10 +312,12 @@ class BacktestStrategyAdapter:
             self._open_entry = 0.0
             return Signal(ts, symbol, "SELL", qty=qty, reason="signal_flip")
 
-        # Entry path: only on positive signal with no position
+        # Entry path: only on positive signal with no position.
+        # Note: the hard MIN_ALPHA_THRESHOLD pre-check has been removed — the
+        # RiskManager's self-calibrating adaptive threshold (Task 4) now
+        # handles signal-gating internally, including the static fallback
+        # during warm-up.
         if self._open_qty > 0 or ml_signal <= 0:
-            return None
-        if abs(ml_signal) < settings.strategy.MIN_ALPHA_THRESHOLD:
             return None
 
         # Call the REAL RiskManager for sizing. Uses asyncio so we bounce
@@ -311,6 +331,7 @@ class BacktestStrategyAdapter:
                     vol           = float(vol_ann),
                     gri           = self._gri,
                     redis_client  = self._fake_redis,  # type: ignore[arg-type]
+                    ml_confidence = float(ml_conf),
                 )
             )
         except Exception as exc:

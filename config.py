@@ -372,6 +372,40 @@ class StrategyConfig:
     BOOTSTRAP_MAX_POSITION_FRACTION: float = 0.35
     BOOTSTRAP_MIN_TRADE_VALUE:       float = 500.0
 
+    # ---------------------------------------------------------------------------
+    # Task-4: Self-calibrating alpha threshold + confidence-weighted Kelly
+    # ---------------------------------------------------------------------------
+    # Rather than using a single static MIN_ALPHA_THRESHOLD for every symbol and
+    # regime, the RiskManager maintains a rolling window of recent |ml_signal|
+    # observations per symbol and uses a high-percentile cut as the gate. This
+    # means the bot naturally trades more frequently in quiet regimes and more
+    # selectively in noisy regimes, without the operator having to retune a
+    # fixed constant.
+    #
+    # The confidence-weighted Kelly knob haircuts the final Kelly fraction by
+    # min(1, conf/target) with a floor — high-confidence signals size at full
+    # Kelly, low-confidence signals never drop below the floor (so even weak
+    # edges still get SOME capital, just much less).
+    #
+    # Both toggles default ON. Setting either to false reverts to the R-10
+    # behaviour: static MIN_ALPHA_THRESHOLD + unmodified KELLY_FRACTION.
+    ADAPTIVE_ALPHA_ENABLED:       bool  = field(
+        default_factory=lambda: _optional("ADAPTIVE_ALPHA_ENABLED", "true").lower() == "true"
+    )
+    ALPHA_PERCENTILE_WINDOW:      int   = 200    # Rolling observations per symbol
+    ALPHA_PERCENTILE:             float = 0.90   # 90th percentile
+    ALPHA_MIN_OBSERVATIONS:       int   = 30     # Fall back to static until this many seen
+    # Never let the adaptive threshold drop below the static minimum — this
+    # protects against the degenerate case of a pure-flat regime where 90% of
+    # |ml_signal| values are ~zero.
+    ALPHA_ADAPTIVE_FLOOR_MULT:    float = 1.0    # 1.0 × MIN_ALPHA_THRESHOLD
+
+    CONFIDENCE_KELLY_ENABLED:     bool  = field(
+        default_factory=lambda: _optional("CONFIDENCE_KELLY_ENABLED", "true").lower() == "true"
+    )
+    CONFIDENCE_KELLY_TARGET:      float = 0.70   # Full Kelly at conf ≥ 0.70
+    CONFIDENCE_KELLY_FLOOR:       float = 0.30   # Never shrink below 30% of computed Kelly
+
 
 # ---------------------------------------------------------------------------
 # Logging

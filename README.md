@@ -329,6 +329,8 @@ python main.py
 | `AUTO_SYNC_MAX_CAPITAL` | — | Hard ceiling on auto-synced capital (INR). Default `10000000` (₹1 Cr) |
 | `BOOTSTRAP_MODE` | — | `true` to auto-apply small-capital sizing when active capital is below threshold. Default `true` |
 | `BOOTSTRAP_CAPITAL_THRESHOLD` | — | INR cap below which bootstrap sizing activates. Default `50000` |
+| `ADAPTIVE_ALPHA_ENABLED` | — | Task-4: rolling 90th-percentile alpha gate per symbol (200-bar window, 30-bar warmup to static `MIN_ALPHA_THRESHOLD`). Default `true` |
+| `CONFIDENCE_KELLY_ENABLED` | — | Task-4: haircut Kelly fraction by `min(1, conf/0.70)` floored at `0.30`. Default `true` |
 
 ---
 
