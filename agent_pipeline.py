@@ -145,17 +145,17 @@ class ModelRotator:
     #   ACTUAL project limits (read from Google AI Studio Rate Limit dashboard,
     #   NOT the documented defaults which apply only to paid/billing-enabled tiers).
     #
-    #   gemini-2.5-flash      → 5 RPM,  20 RPD   (primary quality model)
-    #   gemini-2.5-flash-lite → 15 RPM, 20 RPD   (high-volume fallback — same RPD cap on free tier)
-    #   gemini-2.5-pro        → 5 RPM,  20 RPD   (reserved for risk manager)
+    #   gemini-2.5-flash      → 15 RPM, 1500 RPD
+    #   gemini-2.5-flash-lite → 15 RPM, 1500 RPD
+    #   gemini-2.5-pro        → 5 RPM,  50 RPD
     #
     # NOTE: If you set up billing, update these values to reflect the raised limits
-    # shown in the Google AI Studio dashboard. The rpd_limit here is deliberately
-    # set to 18 (not 20) to leave a 2-call safety margin and avoid hitting the wall.
+    # shown in the Google AI Studio dashboard. The rpd_limit here is set with a
+    # 5-10% safety margin to avoid hitting the wall.
     _POOL: List[_ModelSlot] = [
-        _ModelSlot("gemini-2.5-flash",      "2.5 Flash",      quality=4, rpm_limit=5,  rpd_limit=18, tier="flash"),
-        _ModelSlot("gemini-2.5-flash-lite",  "2.5 Flash-Lite", quality=3, rpm_limit=15, rpd_limit=18, tier="flash"),
-        _ModelSlot("gemini-2.5-pro",         "2.5 Pro",        quality=5, rpm_limit=5,  rpd_limit=18, tier="pro"),
+        _ModelSlot("gemini-2.5-flash",      "2.5 Flash",      quality=4, rpm_limit=15, rpd_limit=1400, tier="flash"),
+        _ModelSlot("gemini-2.5-flash-lite",  "2.5 Flash-Lite", quality=3, rpm_limit=15, rpd_limit=1400, tier="flash"),
+        _ModelSlot("gemini-2.5-pro",         "2.5 Pro",        quality=5, rpm_limit=5,  rpd_limit=45,   tier="pro"),
     ]
 
     # Cooldowns: separate RPM vs RPD exhaustion
@@ -438,33 +438,25 @@ class ModelRotator:
         """
         Recommended sleep between sentiment cycles.
 
-        FIX B-17: Recalibrated for actual free-tier limits (18 RPD budget across 3 models).
+        Recalibrated for free-tier limits (1400 RPD for Flash).
         NSE market day = 375 minutes (09:15 – 15:30 IST).
-        With 18 calls/day budget: 375 min / 18 calls = ~20.8 min/call → 1250s minimum.
-        We use tiered intervals, reserving extra calls for high-risk windows.
-
-        Budget allocation (18 calls/day on primary Flash model):
-          Opening (30 min)   → 1 call  (1250s interval, but window is short)
-          Pre-close (30 min) → 1 call
-          EXTREME GRI        → 2 calls (600s × 2 = 20 min)
-          HIGH GRI           → 3 calls (900s × 3 = 45 min)
-          ELEVATED (default) → 8 calls (1200s intervals)
-          Remaining          → 3 calls buffer
-
-        Previous intervals (180s–600s) assumed 250 RPD. With 18 RPD, those intervals
-        would exhaust the daily budget in 54 minutes at EXTREME (18 × 180s / 60 = 54min).
+        With 1400 RPD, we can comfortably poll every 1 minute (375 calls/day)
+        and still have 1000+ calls left for other services or long sessions.
+        
+        However, to avoid local RPM spikes and respect the smaller Pro quota (45 RPD),
+        we use these intervals:
         """
         now  = time.time()
         ist  = datetime.fromtimestamp(now, tz=_IST)
         hour = ist.hour + ist.minute / 60.0
 
-        if 9.25 <= hour <= 9.75:   return 900    # Opening  — 1 call per 15min window
-        if 15.0 <= hour <= 15.5:   return 900    # Pre-close — 1 call per 15min window
-        if gri_composite >= 0.65:  return 600    # EXTREME risk — 1 call per 10 min
-        if gri_composite >= 0.50:  return 900    # HIGH risk    — 1 call per 15 min
-        if gri_composite >= 0.30:  return 1200   # ELEVATED (default) — 1 call per 20 min
-        if gri_composite >= 0.15:  return 1500   # MODERATE    — 1 call per 25 min
-        return 1800                             # LOW — conserve budget (1 call per 30 min)
+        if 9.25 <= hour <= 9.75:   return 180    # Opening  — 3 min
+        if 15.0 <= hour <= 15.5:   return 180    # Pre-close — 3 min
+        if gri_composite >= 0.65:  return 120    # EXTREME risk
+        if gri_composite >= 0.50:  return 180    # HIGH risk
+        if gri_composite >= 0.30:  return 300    # ELEVATED (default) — 5 min
+        if gri_composite >= 0.15:  return 480    # MODERATE
+        return 600                             # LOW
 
     def can_afford_risk_manager(self) -> bool:
         """
