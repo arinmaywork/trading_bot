@@ -581,31 +581,35 @@ class RiskManager:
             cost   = _round_trip_cost(final)
             exp_pl = _expected_pnl(final)
 
-            # R-12: Safety margin — profit should be at least 2.0x the round-trip cost
-            # to account for slippage and execution latency.
-            if exp_pl < 2.0 * cost:
+            # Tune-1: hurdle multiplier is now config-driven. Earlier the
+            # constant 2.0 was too generous — model overpredicts P&L by ~30×
+            # so realised gross was ~zero while costs ate ~₹25/trade. Default
+            # is now 5.0 (settings.strategy.COST_HURDLE_MULTIPLIER).
+            _hurdle_mult = float(getattr(settings.strategy, "COST_HURDLE_MULTIPLIER", 2.0))
+            if exp_pl < _hurdle_mult * cost:
                 # Kelly qty is too small — try bumping up to effective MIN_TRADE_VALUE
                 # (Task-1: bootstrap mode lowers this for small accounts)
                 min_qty = math.ceil(eff_min_trade_val / current_price)
                 min_qty = max(min_qty, final)
                 max_allowed = int(eff_max_frac * self._capital / current_price)
-                if min_qty <= max_allowed and _expected_pnl(min_qty) > 2.0 * _round_trip_cost(min_qty):
+                if min_qty <= max_allowed and _expected_pnl(min_qty) > _hurdle_mult * _round_trip_cost(min_qty):
                     logger.info(
-                        "CostFilter %s: bumping qty %d→%d to clear 2x brokerage hurdle "
+                        "CostFilter %s: bumping qty %d→%d to clear %.1fx brokerage hurdle "
                         "(exp_pnl=₹%.2f cost=₹%.2f)",
-                        symbol, final, min_qty, _expected_pnl(min_qty), _round_trip_cost(min_qty),
+                        symbol, final, min_qty, _hurdle_mult,
+                        _expected_pnl(min_qty), _round_trip_cost(min_qty),
                     )
                     final = min_qty
                 else:
-                    logger.warning(                              # Bug #13: elevated INFO→WARNING
-                        "CostFilter %s: SKIPPING TRADE — exp_pnl=₹%.2f < 2x cost=₹%.2f "
+                    logger.warning(
+                        "CostFilter %s: SKIPPING TRADE — exp_pnl=₹%.2f < %.1fx cost=₹%.2f "
                         "(brokerage+STT hurdle not cleared even at min_trade_value=₹%.0f). "
                         "Tip: increase capital or wait for a stronger signal.",
-                        symbol, exp_pl, cost, eff_min_trade_val,
+                        symbol, exp_pl, _hurdle_mult, cost, eff_min_trade_val,
                     )
                     return 0, f_final, f_busseti, False, (
-                        f"Trade cost ₹{cost:.2f} too high vs exp P&L ₹{exp_pl:.2f} (2x hurdle) — "
-                        f"increase capital or wait for stronger signal"
+                        f"Trade cost ₹{cost:.2f} too high vs exp P&L ₹{exp_pl:.2f} "
+                        f"({_hurdle_mult:.1f}x hurdle) — wait for stronger signal"
                     )
         # ── End cost filter ──────────────────────────────────────────────────
 

@@ -245,7 +245,18 @@ class StrategyConfig:
     )
     KELLY_FRACTION:              float = 0.50   # Used as fallback only; Busseti is primary
     MAX_POSITION_FRACTION:       float = 0.05
-    MIN_ALPHA_THRESHOLD:         float = 0.005  # R-10: raised from 0.001 → 0.5% min signal
+    # Tune-1: was 0.005. Backtests showed 1000+ trades / gross ≈ 0 — model
+    # overpredicts realised P&L by ~30×. Raising to 1.5% so only signals that
+    # forecast a meaningful move pass the gate.
+    MIN_ALPHA_THRESHOLD:         float = field(
+        default_factory=lambda: float(_optional("MIN_ALPHA_THRESHOLD", "0.015"))
+    )
+    # Tune-1: cost filter safety multiplier. Was a hard-coded 2.0 in
+    # strategy.py; raised to 5.0 because realised/predicted P&L ratio is
+    # ~1:30, so a higher hurdle is required for an entry to be EV-positive.
+    COST_HURDLE_MULTIPLIER:      float = field(
+        default_factory=lambda: float(_optional("COST_HURDLE_MULTIPLIER", "5.0"))
+    )
     VOL_SPIKE_THRESHOLD:         float = 2.0
     GEOPOLITICAL_RISK_THRESHOLD: float = 0.65
     VWAP_LOOKBACK:               int   = 30
@@ -302,9 +313,19 @@ class StrategyConfig:
     # TSL_ACTIVATION_PCT: Profit % at which TSL starts trailing (e.g. 0.6%)
     # TSL_CALLBACK_PCT:   % distance from peak price to trigger exit (e.g. 0.3%)
     # HARD_STOP_LOSS_PCT: Max loss from entry price before emergency exit (e.g. 1.0%)
-    TSL_ACTIVATION_PCT:   float = 0.006   # 0.6% profit triggers TSL
-    TSL_CALLBACK_PCT:     float = 0.003   # 0.3% trailing buffer
-    HARD_STOP_LOSS_PCT:   float = 0.012   # 1.2% hard stop
+    # Tune-1: prior config (0.6/0.3/1.2) created a 1:4 R:R against the bot —
+    # winners gave back 0.3 % the moment they hit 0.6 %, losers ran 1.2 %.
+    # New profile widens the trail and tightens the hard stop so a 50/50
+    # signal mix is at least neutral EV before any edge is added.
+    TSL_ACTIVATION_PCT:   float = field(
+        default_factory=lambda: float(_optional("TSL_ACTIVATION_PCT", "0.004"))
+    )   # 0.4% activates trail (was 0.6%)
+    TSL_CALLBACK_PCT:     float = field(
+        default_factory=lambda: float(_optional("TSL_CALLBACK_PCT", "0.005"))
+    )   # 0.5% trailing buffer (was 0.3%)
+    HARD_STOP_LOSS_PCT:   float = field(
+        default_factory=lambda: float(_optional("HARD_STOP_LOSS_PCT", "0.008"))
+    )   # 0.8% hard stop (was 1.2%)
 
     # ---------------------------------------------------------------------------
     # R-11: CNC / MIS Hybrid Strategy
@@ -425,7 +446,11 @@ class StrategyConfig:
         default_factory=lambda: _optional("ADAPTIVE_ALPHA_ENABLED", "true").lower() == "true"
     )
     ALPHA_PERCENTILE_WINDOW:      int   = 200    # Rolling observations per symbol
-    ALPHA_PERCENTILE:             float = 0.90   # 90th percentile
+    # Tune-1: was 0.90. With 1000+ realised trades, the 90th percentile is
+    # still inside noise. 0.95 keeps only the strongest 5% of signals.
+    ALPHA_PERCENTILE:             float = field(
+        default_factory=lambda: float(_optional("ALPHA_PERCENTILE", "0.95"))
+    )
     ALPHA_MIN_OBSERVATIONS:       int   = 30     # Fall back to static until this many seen
     # Never let the adaptive threshold drop below the static minimum — this
     # protects against the degenerate case of a pure-flat regime where 90% of
