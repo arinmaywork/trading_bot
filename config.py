@@ -248,14 +248,16 @@ class StrategyConfig:
     # Tune-1: was 0.005. Backtests showed 1000+ trades / gross ≈ 0 — model
     # overpredicts realised P&L by ~30×. Raising to 1.5% so only signals that
     # forecast a meaningful move pass the gate.
+    # Tune-2: 0.005 → 0.015 was too aggressive (1-8 trades / 90d). Eased
+    # to 0.008 — still 60% tighter than original, should yield ~100-300
+    # trades / 90d while filtering the weakest noise.
     MIN_ALPHA_THRESHOLD:         float = field(
-        default_factory=lambda: float(_optional("MIN_ALPHA_THRESHOLD", "0.015"))
+        default_factory=lambda: float(_optional("MIN_ALPHA_THRESHOLD", "0.008"))
     )
-    # Tune-1: cost filter safety multiplier. Was a hard-coded 2.0 in
-    # strategy.py; raised to 5.0 because realised/predicted P&L ratio is
-    # ~1:30, so a higher hurdle is required for an entry to be EV-positive.
+    # Tune-2: 5.0 was too tight (killed virtually all entries). Eased to
+    # 3.0 — still 50% stricter than original 2.0.
     COST_HURDLE_MULTIPLIER:      float = field(
-        default_factory=lambda: float(_optional("COST_HURDLE_MULTIPLIER", "5.0"))
+        default_factory=lambda: float(_optional("COST_HURDLE_MULTIPLIER", "3.0"))
     )
     VOL_SPIKE_THRESHOLD:         float = 2.0
     GEOPOLITICAL_RISK_THRESHOLD: float = 0.65
@@ -446,10 +448,10 @@ class StrategyConfig:
         default_factory=lambda: _optional("ADAPTIVE_ALPHA_ENABLED", "true").lower() == "true"
     )
     ALPHA_PERCENTILE_WINDOW:      int   = 200    # Rolling observations per symbol
-    # Tune-1: was 0.90. With 1000+ realised trades, the 90th percentile is
-    # still inside noise. 0.95 keeps only the strongest 5% of signals.
+    # Tune-2: 0.95 was too aggressive (combined with other gates, killed
+    # almost everything). Eased to 0.92 — still tighter than original 0.90.
     ALPHA_PERCENTILE:             float = field(
-        default_factory=lambda: float(_optional("ALPHA_PERCENTILE", "0.95"))
+        default_factory=lambda: float(_optional("ALPHA_PERCENTILE", "0.92"))
     )
     ALPHA_MIN_OBSERVATIONS:       int   = 30     # Fall back to static until this many seen
     # Never let the adaptive threshold drop below the static minimum — this

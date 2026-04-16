@@ -44,14 +44,17 @@ class GateDefaultsTests(unittest.TestCase):
         from config import settings  # noqa: PLC0415
         self.cfg = settings.strategy
 
-    def test_min_alpha_at_least_1pct(self):
-        self.assertGreaterEqual(self.cfg.MIN_ALPHA_THRESHOLD, 0.010)
+    def test_min_alpha_stricter_than_original(self):
+        # Original was 0.005; must stay above that
+        self.assertGreater(self.cfg.MIN_ALPHA_THRESHOLD, 0.005)
 
-    def test_cost_hurdle_at_least_4x(self):
-        self.assertGreaterEqual(self.cfg.COST_HURDLE_MULTIPLIER, 4.0)
+    def test_cost_hurdle_above_original(self):
+        # Original was hard-coded 2.0; must stay above that
+        self.assertGreater(self.cfg.COST_HURDLE_MULTIPLIER, 2.0)
 
-    def test_alpha_percentile_at_least_p93(self):
-        self.assertGreaterEqual(self.cfg.ALPHA_PERCENTILE, 0.93)
+    def test_alpha_percentile_above_original(self):
+        # Original was 0.90; must stay above that
+        self.assertGreater(self.cfg.ALPHA_PERCENTILE, 0.90)
 
     def test_hard_stop_tightened(self):
         # Was 1.2% → now ≤ 1.0%
