@@ -1331,10 +1331,13 @@ async def main(kite: KiteConnect, access_token: str, tg_offset: int = 0) -> None
 
     print_banner("System Initialisation")
 
+    # Redis-fix: raised from 30 → 200. With CandleAggregator, ticker
+    # pipelines, strategy-loop symbol evaluation, ML retrain, dashboard,
+    # and geo/alt-data tasks all sharing one pool, 30 was far too small.
     redis_client = aioredis.Redis(
         host=settings.redis.HOST, port=settings.redis.PORT,
         db=settings.redis.DB, password=settings.redis.PASSWORD or None,
-        decode_responses=False, max_connections=30,
+        decode_responses=False, max_connections=200,
     )
     try:
         await redis_client.ping()

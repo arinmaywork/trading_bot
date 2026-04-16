@@ -855,15 +855,18 @@ class UniverseEngine:
         # Re-persist updated scores to Redis
         if rescored:
             pipe = self._redis.pipeline()
-            for sym, score in rescored:
-                pipe.zadd(settings.redis.UNIVERSE_KEY, {sym: score})
-                meta = self._metadata.get(sym)
-                if meta:
-                    pipe.hset(
-                        f"{settings.redis.UNIVERSE_META_KEY}:{sym}",
-                        mapping=meta.to_redis_dict(),
-                    )
-            await pipe.execute()
+            try:
+                for sym, score in rescored:
+                    pipe.zadd(settings.redis.UNIVERSE_KEY, {sym: score})
+                    meta = self._metadata.get(sym)
+                    if meta:
+                        pipe.hset(
+                            f"{settings.redis.UNIVERSE_META_KEY}:{sym}",
+                            mapping=meta.to_redis_dict(),
+                        )
+                await pipe.execute()
+            finally:
+                await pipe.reset()
 
         # Re-sort active symbols by updated scores
         self._active_symbols = sorted(
@@ -890,19 +893,21 @@ class UniverseEngine:
           • Hash: UNIVERSE_META_KEY:SYMBOL → metadata fields
         """
         pipe = self._redis.pipeline()
+        try:
+            # Clear old universe
+            pipe.delete(settings.redis.UNIVERSE_KEY)
 
-        # Clear old universe
-        pipe.delete(settings.redis.UNIVERSE_KEY)
+            for meta in universe:
+                pipe.zadd(settings.redis.UNIVERSE_KEY, {meta.symbol: meta.composite_score})
+                pipe.hset(
+                    f"{settings.redis.UNIVERSE_META_KEY}:{meta.symbol}",
+                    mapping=meta.to_redis_dict(),
+                )
+                pipe.expire(f"{settings.redis.UNIVERSE_META_KEY}:{meta.symbol}", 86400)
 
-        for meta in universe:
-            pipe.zadd(settings.redis.UNIVERSE_KEY, {meta.symbol: meta.composite_score})
-            pipe.hset(
-                f"{settings.redis.UNIVERSE_META_KEY}:{meta.symbol}",
-                mapping=meta.to_redis_dict(),
-            )
-            pipe.expire(f"{settings.redis.UNIVERSE_META_KEY}:{meta.symbol}", 86400)
-
-        await pipe.execute()
+            await pipe.execute()
+        finally:
+            await pipe.reset()
         logger.debug("Universe persisted to Redis (%d symbols).", len(universe))
 
     async def _load_from_redis(self) -> bool:

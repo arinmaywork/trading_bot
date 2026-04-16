@@ -230,10 +230,19 @@ class FeatureStore:
         """Append a labelled observation. Returns current window size."""
         key     = self._key(symbol)
         payload = json.dumps(fv.to_dict())
-        await self._redis.rpush(key, payload)
-        await self._redis.ltrim(key, -self.MAX_WINDOW, -1)
-        await self._redis.expire(key, self.REDIS_TTL)
-        return await self._redis.llen(key)
+        # Redis-fix: pipeline 4 commands into one round-trip instead of 4
+        # separate connections. With 50+ symbols calling append() each cycle,
+        # this cuts connection pressure by 75%.
+        pipe = self._redis.pipeline()
+        try:
+            pipe.rpush(key, payload)
+            pipe.ltrim(key, -self.MAX_WINDOW, -1)
+            pipe.expire(key, self.REDIS_TTL)
+            pipe.llen(key)
+            results = await pipe.execute()
+            return int(results[-1])  # llen result
+        finally:
+            await pipe.reset()
 
     async def get_all(self, symbol: str) -> List[FeatureVector]:
         """Retrieve all stored observations for a symbol."""

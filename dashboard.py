@@ -283,9 +283,13 @@ async def _startup() -> None:
     global _redis
     if _REDIS_OK:
         try:
-            _redis = aioredis.from_url(REDIS_URL, decode_responses=False)
+            # Redis-fix: limit dashboard to its own small pool (10) instead of
+            # the default unlimited pool, so it can't starve the main bot.
+            _redis = aioredis.from_url(
+                REDIS_URL, decode_responses=False, max_connections=10,
+            )
             await _redis.ping()
-            logger.info("Dashboard connected to Redis at %s", REDIS_URL)
+            logger.info("Dashboard connected to Redis at %s (pool=10)", REDIS_URL)
         except Exception as exc:
             logger.warning("Redis unavailable (%s) — dashboard in log-only mode", exc)
             _redis = None

@@ -268,17 +268,22 @@ class CandleAggregator:
                 ts = datetime.now(timezone.utc)
 
             key  = self._bucket_key(symbol, ts)
+            # Redis-fix: wrap pipeline in try/finally so the connection is
+            # always returned to the pool even if an exception fires mid-batch.
             pipe = self._redis.pipeline()
-            pipe.hsetnx(key, "open", price)
-            pipe.hset(key, "close", price)
-            pipe.hincrbyfloat(key, "volume", volume)
-            pipe.hincrbyfloat(key, "vwap_sum", price * volume)
-            pipe.hincrby(key, "tick_count", 1)
-            pipe.hincrbyfloat(key, "mlofi_sum", mlofi)
-            pipe.hincrbyfloat(key, "aflow_delta_sum", aflow_d)
-            pipe.hset(key, "aflow_ratio", aflow_r)
-            pipe.expire(key, self._ttl)
-            await pipe.execute()
+            try:
+                pipe.hsetnx(key, "open", price)
+                pipe.hset(key, "close", price)
+                pipe.hincrbyfloat(key, "volume", volume)
+                pipe.hincrbyfloat(key, "vwap_sum", price * volume)
+                pipe.hincrby(key, "tick_count", 1)
+                pipe.hincrbyfloat(key, "mlofi_sum", mlofi)
+                pipe.hincrbyfloat(key, "aflow_delta_sum", aflow_d)
+                pipe.hset(key, "aflow_ratio", aflow_r)
+                pipe.expire(key, self._ttl)
+                await pipe.execute()
+            finally:
+                await pipe.reset()
 
             await self._redis.eval(
                 """
@@ -428,11 +433,16 @@ class AsyncKiteTickerWrapper:
                 self._aflow[symbol] = aflow
 
                 # Write to Redis atomically
+                # Redis-fix: try/finally ensures pipeline connection returns to
+                # pool even if execute() raises (e.g. pool exhaustion, timeout).
                 pipe = self._redis.pipeline()
-                pipe.set(f"{settings.redis.OFI_KEY_PREFIX}{symbol}", str(ofi), ex=60)
-                pipe.set(f"mlofi:{symbol}", str(mlofi), ex=60)
-                pipe.set(f"aflow:{symbol}", json.dumps(aflow.to_dict()), ex=60)
-                await pipe.execute()
+                try:
+                    pipe.set(f"{settings.redis.OFI_KEY_PREFIX}{symbol}", str(ofi), ex=60)
+                    pipe.set(f"mlofi:{symbol}", str(mlofi), ex=60)
+                    pipe.set(f"aflow:{symbol}", json.dumps(aflow.to_dict()), ex=60)
+                    await pipe.execute()
+                finally:
+                    await pipe.reset()
 
                 await self._stream_writer.publish_tick(symbol, tick, ofi, mlofi, aflow)
                 self._tick_count += 1
