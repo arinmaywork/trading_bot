@@ -72,6 +72,16 @@ from universe import FrequencyOptimiser, UniverseEngine
 from position_manager import PositionManager
 from portfolio_risk import PortfolioRiskMonitor
 
+# --- Profitability Plan: new modules ---
+from ml_signal import TierSignalEngine, Tier1FeatureVector, Tier2FeatureVector
+from regime_detector import RegimeDetector, RegimeConfig as _RegimeConfig
+from tier_router import TierRouter, TierConfig as _TierConfig, StrategyTier
+from diagnostics import FilterFunnel, TradeAttribution, SignalDistribution
+from model_health import CalibrationTracker, FeatureImportanceTracker
+from features.microstructure import MicrostructureState, compute_tier1_features
+from features.mean_reversion import MeanReversionState, compute_tier2_features
+from features.seasonality import time_of_day_features, day_of_week_feature, is_no_trade_zone
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -1355,6 +1365,22 @@ async def main(kite: KiteConnect, access_token: str, tg_offset: int = 0) -> None
     geo_monitor    = GeopoliticalRiskMonitor(redis_client)
     risk_manager   = RiskManager(settings.strategy.TOTAL_CAPITAL)
     ml_engine      = EnsembleSignalEngine(redis_client)
+
+    # --- Profitability Plan: multi-tier engine + diagnostics ---
+    tier_engine = TierSignalEngine(redis_client, ml_engine)
+    regime_detector = RegimeDetector()
+    tier_router = TierRouter()
+    filter_funnel = FilterFunnel()
+    trade_attribution = TradeAttribution()
+    signal_distribution = SignalDistribution()
+    calibration_tracker = CalibrationTracker()
+    feature_importance_tracker = FeatureImportanceTracker()
+    # Per-symbol microstructure and mean-reversion state
+    micro_states: Dict[str, MicrostructureState] = {}
+    mr_states: Dict[str, MeanReversionState] = {}
+    logger.info("Profitability-plan modules initialized: tier_engine, regime_detector, "
+                "tier_router, diagnostics, model_health")
+
     agent_pipeline = AgentPipeline()
     logbook        = Logbook()
     bot_state      = BotState()
@@ -1680,11 +1706,15 @@ async def main(kite: KiteConnect, access_token: str, tg_offset: int = 0) -> None
     ml_retrain_task   = asyncio.create_task(
         ml_engine.run_retrain_loop(active_symbols), name="ml_retrain"
     )
+    # Profitability Plan: tier retrain loop
+    tier_retrain_task = asyncio.create_task(
+        tier_engine.run_retrain_loop(active_symbols), name="tier_retrain_loop"
+    )
     logbook_task   = asyncio.create_task(logbook.run_summary_loop(), name="logbook")
     tg_status_task = asyncio.create_task(tg_controller.status_broadcast_loop(), name="tg_status")
 
     all_tasks = [candle_task, strat_task, sentiment_task, token_watch_task,
-                 ml_retrain_task, logbook_task, tg_status_task] \
+                 ml_retrain_task, tier_retrain_task, logbook_task, tg_status_task] \
                 + alt_tasks + geo_tasks + universe_tasks
 
     for t in all_tasks:

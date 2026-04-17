@@ -193,6 +193,12 @@ class TelegramController:
         # UniverseEngine reference — populated by main.py via set_universe()
         self._universe         = None
         self._backtest_running = False
+        # ── Profitability plan: diagnostic providers ──────────────────────
+        self._filter_funnel = None
+        self._regime_detector = None
+        self._calibration_tracker = None
+        self._feature_importance_tracker = None
+        self._signal_distribution = None
 
     # ── Token hot-swap ────────────────────────────────────────────────────
 
@@ -255,6 +261,26 @@ class TelegramController:
         (kite.margins() schema). Used by /synccapital and /balance.
         """
         self._margin_fetcher = fetcher
+
+    def set_filter_funnel(self, funnel) -> None:
+        """Register the filter funnel provider for /funnel command."""
+        self._filter_funnel = funnel
+
+    def set_regime_detector(self, detector) -> None:
+        """Register the regime detector for /regime command."""
+        self._regime_detector = detector
+
+    def set_calibration_tracker(self, tracker) -> None:
+        """Register the calibration tracker for /model_health command."""
+        self._calibration_tracker = tracker
+
+    def set_feature_importance_tracker(self, tracker) -> None:
+        """Register the feature importance tracker for /features command."""
+        self._feature_importance_tracker = tracker
+
+    def set_signal_distribution(self, dist) -> None:
+        """Register the signal distribution tracker for /signals command."""
+        self._signal_distribution = dist
 
     def _save_token_cache(self, token: str) -> None:
         try:
@@ -457,6 +483,13 @@ class TelegramController:
                 "/login — Get today's Zerodha login URL\n"
                 "/token &lt;request_token&gt; — Apply new token\n"
                 "  Or paste the full redirect URL after /token\n"
+                f"{'─' * 28}\n"
+                "📈 <b>Model Diagnostics (Profitability Plan)</b>\n"
+                "/funnel — Filter funnel (signal gate pass-through rates)\n"
+                "/regime — Current market regime\n"
+                "/model_health — ML model calibration status\n"
+                "/features [SYM] — Feature importance (optional: per symbol)\n"
+                "/signals — Signal distribution stats\n"
                 f"{'─' * 28}\n"
                 "/help — This message\n"
             )
@@ -1011,6 +1044,78 @@ class TelegramController:
                     f"<pre>{summary}</pre>\n"
                     f"All models are now available. The bot will retry Gemini on the next sentiment cycle."
                 )
+
+        elif cmd == "/funnel":
+            # ── Filter funnel diagnostic ─────────────────────────────────────
+            if self._filter_funnel is None:
+                await self.send("⚠️ Filter funnel not initialized.")
+            else:
+                try:
+                    await self.send(self._filter_funnel.format_funnel(), parse_mode="HTML")
+                except Exception as exc:
+                    logger.error("/funnel error: %s", exc, exc_info=True)
+                    await self.send(f"❌ Funnel report failed: <code>{exc}</code>")
+
+        elif cmd == "/regime":
+            # ── Market regime diagnostic ─────────────────────────────────────
+            if self._regime_detector is None:
+                await self.send("⚠️ Regime detector not initialized.")
+            else:
+                try:
+                    state = self._regime_detector.state
+                    text = (
+                        f"🏛 <b>Market Regime</b>\n"
+                        f"{'─' * 32}\n"
+                        f"Regime: <b>{state.current_regime.value}</b>\n"
+                        f"Confidence: {state.confidence:.2f}\n"
+                        f"ADX: {state.adx_value:.1f}\n"
+                        f"VIX: {state.vix_value:.1f}\n"
+                        f"NIFTY 60m ret: {state.nifty_ret_60min:.4f}\n"
+                        f"Bollinger BW: {state.bollinger_bw:.4f}\n"
+                        f"Vol (1h): {state.realised_vol_1h:.4f}"
+                    )
+                    await self.send(text, parse_mode="HTML")
+                except Exception as exc:
+                    logger.error("/regime error: %s", exc, exc_info=True)
+                    await self.send(f"❌ Regime report failed: <code>{exc}</code>")
+
+        elif cmd == "/model_health":
+            # ── ML model calibration status ──────────────────────────────────
+            if self._calibration_tracker is None:
+                await self.send("⚠️ Model health tracker not initialized.")
+            else:
+                try:
+                    await self.send(self._calibration_tracker.format_health(), parse_mode="HTML")
+                except Exception as exc:
+                    logger.error("/model_health error: %s", exc, exc_info=True)
+                    await self.send(f"❌ Model health report failed: <code>{exc}</code>")
+
+        elif cmd == "/features":
+            # ── Feature importance diagnostic ────────────────────────────────
+            if self._feature_importance_tracker is None:
+                await self.send("⚠️ Feature importance tracker not initialized.")
+            else:
+                try:
+                    parts = text.strip().split(None, 1)
+                    symbol = parts[1].strip().upper() if len(parts) > 1 else None
+                    await self.send(
+                        self._feature_importance_tracker.format_importance(symbol=symbol),
+                        parse_mode="HTML"
+                    )
+                except Exception as exc:
+                    logger.error("/features error: %s", exc, exc_info=True)
+                    await self.send(f"❌ Feature importance report failed: <code>{exc}</code>")
+
+        elif cmd == "/signals":
+            # ── Signal distribution stats ────────────────────────────────────
+            if self._signal_distribution is None:
+                await self.send("⚠️ Signal distribution tracker not initialized.")
+            else:
+                try:
+                    await self.send(self._signal_distribution.format_distribution(), parse_mode="HTML")
+                except Exception as exc:
+                    logger.error("/signals error: %s", exc, exc_info=True)
+                    await self.send(f"❌ Signal distribution report failed: <code>{exc}</code>")
 
         elif cmd == "/stop":
             await self.send("🛑 <b>Shutdown requested.</b> Bot will stop gracefully.")

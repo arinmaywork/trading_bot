@@ -501,23 +501,117 @@ class LoggingConfig:
 
 
 # ---------------------------------------------------------------------------
-# Master settings object  (V2)
+# Profitability-Plan: Regime Detection
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class RegimeConfig:
+    """Market regime detection thresholds (Phase 4)."""
+    ENABLED: bool = field(
+        default_factory=lambda: _optional("REGIME_DETECTION_ENABLED", "true").lower() == "true"
+    )
+    ADX_TRENDING_THRESHOLD:       float = 25.0
+    ADX_MEAN_REVERT_THRESHOLD:    float = 20.0
+    VIX_VOLATILE_THRESHOLD:       float = 20.0
+    NIFTY_RET_TRENDING_THRESHOLD: float = 0.003   # 0.3%
+    BOLLINGER_BW_MR_THRESHOLD:    float = 0.02    # 2%
+    VOL_ANNUALISED_VOL_THRESHOLD: float = 0.25    # 25%
+    UPDATE_INTERVAL_S:            float = 900.0   # re-evaluate every 15 min
+
+
+# ---------------------------------------------------------------------------
+# Profitability-Plan: Strategy Tier Routing
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class TierConfig:
+    """Multi-tier strategy routing (Phase 3)."""
+    TIER1_ENABLED: bool = field(
+        default_factory=lambda: _optional("TIER1_ENABLED", "true").lower() == "true"
+    )
+    TIER2_ENABLED: bool = field(
+        default_factory=lambda: _optional("TIER2_ENABLED", "true").lower() == "true"
+    )
+    TIER3_ENABLED: bool = field(
+        default_factory=lambda: _optional("TIER3_ENABLED", "true").lower() == "true"
+    )
+    # Universe sizes per tier
+    TIER1_UNIVERSE_SIZE: int = 8    # Top 8 most liquid NIFTY50 names
+    TIER2_UNIVERSE_SIZE: int = 20   # Top 20 by composite score
+    TIER3_UNIVERSE_SIZE: int = 50   # Full universe for sentiment swing
+    # Capital allocation per tier (must sum to <= 1.0)
+    TIER1_CAPITAL_PCT: float = 0.30
+    TIER2_CAPITAL_PCT: float = 0.50
+    TIER3_CAPITAL_PCT: float = 0.20
+    # Per-tier label delay (target prediction horizon)
+    TIER1_LABEL_DELAY_S: int = 300   # 5-minute forward return
+    TIER2_LABEL_DELAY_S: int = 1800  # 30-minute forward return
+    TIER3_LABEL_DELAY_S: int = 86400 # 1-day forward return (CNC)
+    # Conviction gate (composite conviction score threshold)
+    CONVICTION_GATE: float = field(
+        default_factory=lambda: float(_optional("CONVICTION_GATE", "0.55"))
+    )
+
+
+# ---------------------------------------------------------------------------
+# Profitability-Plan: Model Health Monitoring
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ModelHealthConfig:
+    """ML model calibration and health monitoring (Phase 2)."""
+    ENABLED: bool = field(
+        default_factory=lambda: _optional("MODEL_HEALTH_ENABLED", "true").lower() == "true"
+    )
+    # Information coefficient thresholds
+    IC_DEGRADED_THRESHOLD: float = 0.01
+    IC_BROKEN_THRESHOLD:   float = 0.005
+    # Calibration slope thresholds
+    SLOPE_DEGRADED_THRESHOLD: float = 0.3
+    SLOPE_BROKEN_THRESHOLD:   float = 0.1
+    # Minimum samples before health assessment
+    MIN_SAMPLES: int = 20
+    # Position sizing multipliers by health status
+    HEALTHY_MULT:  float = 1.0
+    DEGRADED_MULT: float = 0.5
+    BROKEN_MULT:   float = 0.0
+    UNKNOWN_MULT:  float = 0.7
+
+
+# ---------------------------------------------------------------------------
+# Profitability-Plan: Intraday No-Trade Zones
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class NoTradeZoneConfig:
+    """Time-based trading restrictions (Phase 4)."""
+    LUNCH_START_HOUR: int = 12
+    LUNCH_START_MIN:  int = 0
+    LUNCH_END_HOUR:   int = 13
+    LUNCH_END_MIN:    int = 0
+    OPENING_GAP_MINUTES: int = 5    # Skip first 5 min after 9:15
+    # On expiry days (Thursday), reduce Tier 1 sizing by this factor
+    EXPIRY_DAY_TIER1_MULT: float = 0.7
+
+
+# ---------------------------------------------------------------------------
+# Master settings object  (V2 + Profitability Plan)
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Settings:
-    kite:     KiteConfig     = field(default_factory=KiteConfig)
-    redis:    RedisConfig    = field(default_factory=RedisConfig)
-    weather:  WeatherConfig  = field(default_factory=WeatherConfig)
-    news:     NewsConfig     = field(default_factory=NewsConfig)
-    gemini:   GeminiConfig   = field(default_factory=GeminiConfig)
-    fred:     FREDConfig     = field(default_factory=FREDConfig)
-    agent:    AgentConfig    = field(default_factory=AgentConfig)
-    ml:       MLConfig       = field(default_factory=MLConfig)
-    busseti:  BussetiConfig  = field(default_factory=BussetiConfig)
-    telegram: TelegramConfig = field(default_factory=TelegramConfig)
-    strategy: StrategyConfig = field(default_factory=StrategyConfig)
-    universe: UniverseConfig = field(default_factory=UniverseConfig)
-    logging:  LoggingConfig  = field(default_factory=LoggingConfig)
+    kite:         KiteConfig       = field(default_factory=KiteConfig)
+    redis:        RedisConfig      = field(default_factory=RedisConfig)
+    weather:      WeatherConfig    = field(default_factory=WeatherConfig)
+    news:         NewsConfig       = field(default_factory=NewsConfig)
+    gemini:       GeminiConfig     = field(default_factory=GeminiConfig)
+    fred:         FREDConfig       = field(default_factory=FREDConfig)
+    agent:        AgentConfig      = field(default_factory=AgentConfig)
+    ml:           MLConfig         = field(default_factory=MLConfig)
+    busseti:      BussetiConfig    = field(default_factory=BussetiConfig)
+    telegram:     TelegramConfig   = field(default_factory=TelegramConfig)
+    strategy:     StrategyConfig   = field(default_factory=StrategyConfig)
+    universe:     UniverseConfig   = field(default_factory=UniverseConfig)
+    logging:      LoggingConfig    = field(default_factory=LoggingConfig)
+    regime:       RegimeConfig     = field(default_factory=RegimeConfig)
+    tiers:        TierConfig       = field(default_factory=TierConfig)
+    model_health: ModelHealthConfig = field(default_factory=ModelHealthConfig)
+    no_trade:     NoTradeZoneConfig = field(default_factory=NoTradeZoneConfig)
 
 
 settings = Settings()

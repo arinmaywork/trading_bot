@@ -140,6 +140,90 @@ class FeatureVector:
 
 
 @dataclass
+class Tier1FeatureVector:
+    """Tier-1 microstructure features for short-term (1-15 min) prediction."""
+    mlofi: float
+    obi_momentum: float        # OBI acceleration
+    aflow_ratio: float
+    trade_arrival_rate: float  # tick rate vs baseline
+    spread_z: float            # bid-ask spread z-score
+    vwpp: float                # volume-weighted price pressure
+    ret_1min: float            # 1-minute log return
+    ret_5min: float            # 5-minute log return
+    reference_price: float = 0.0
+    reference_ts: float = field(default_factory=time.monotonic)
+    fwd_log_return: Optional[float] = None
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    FEATURE_NAMES = [
+        "mlofi", "obi_momentum", "aflow_ratio", "trade_arrival_rate",
+        "spread_z", "vwpp", "ret_1min", "ret_5min",
+    ]
+
+    def to_array(self) -> List[float]:
+        return [self.mlofi, self.obi_momentum, self.aflow_ratio,
+                self.trade_arrival_rate, self.spread_z, self.vwpp,
+                self.ret_1min, self.ret_5min]
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = {n: v for n, v in zip(self.FEATURE_NAMES, self.to_array())}
+        if self.fwd_log_return is not None:
+            d["fwd_log_return"] = self.fwd_log_return
+        d["reference_price"] = self.reference_price
+        d["ts"] = self.timestamp.isoformat()
+        return d
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "Tier1FeatureVector":
+        return cls(**{k: float(d.get(k, 0)) for k in cls.FEATURE_NAMES},
+                   reference_price=float(d.get("reference_price", 0)),
+                   fwd_log_return=d.get("fwd_log_return"))
+
+
+@dataclass
+class Tier2FeatureVector:
+    """Tier-2 mean-reversion features for medium-term (30-60 min) prediction."""
+    vwap_z: float              # standardised VWAP deviation
+    rsi_mr_signal: float       # RSI mean-reversion signal
+    sector_rs: float           # sector relative strength
+    orb_position: float        # opening range breakout position
+    time_sin: float            # cyclical time-of-day (sin)
+    time_cos: float            # cyclical time-of-day (cos)
+    ret_15min: float           # 15-minute log return
+    vol_normalised: float      # annualised volatility
+    aflow_ratio_15min: float   # 15-min avg aggressive flow
+    reference_price: float = 0.0
+    reference_ts: float = field(default_factory=time.monotonic)
+    fwd_log_return: Optional[float] = None
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    FEATURE_NAMES = [
+        "vwap_z", "rsi_mr_signal", "sector_rs", "orb_position",
+        "time_sin", "time_cos", "ret_15min", "vol_normalised",
+        "aflow_ratio_15min",
+    ]
+
+    def to_array(self) -> List[float]:
+        return [self.vwap_z, self.rsi_mr_signal, self.sector_rs,
+                self.orb_position, self.time_sin, self.time_cos,
+                self.ret_15min, self.vol_normalised, self.aflow_ratio_15min]
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = {n: v for n, v in zip(self.FEATURE_NAMES, self.to_array())}
+        if self.fwd_log_return is not None:
+            d["fwd_log_return"] = self.fwd_log_return
+        d["reference_price"] = self.reference_price
+        d["ts"] = self.timestamp.isoformat()
+        return d
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "Tier2FeatureVector":
+        return cls(**{k: float(d.get(k, 0)) for k in cls.FEATURE_NAMES},
+                   reference_price=float(d.get("reference_price", 0)),
+                   fwd_log_return=d.get("fwd_log_return"))
+
+
+@dataclass
 class SignalOutput:
     """ML ensemble output."""
     symbol:              str
@@ -252,6 +336,54 @@ class FeatureStore:
         for r in raw:
             try:
                 out.append(FeatureVector.from_dict(json.loads(r)))
+            except Exception:
+                pass
+        return out
+
+    async def window_size(self, symbol: str) -> int:
+        return await self._redis.llen(self._key(symbol))
+
+    async def ready(self, symbol: str) -> bool:
+        return await self.window_size(symbol) >= self.MIN_TRAIN
+
+
+class TieredFeatureStore:
+    """
+    Feature store for Tier-1 and Tier-2 feature vectors.
+    Separate Redis keys from the original FeatureStore to avoid conflicts.
+    """
+    MAX_WINDOW = 5000
+    MIN_TRAIN = 500
+    REDIS_TTL = 7 * 86400
+
+    def __init__(self, redis_client: aioredis.Redis, tier: str) -> None:
+        self._redis = redis_client
+        self._tier = tier  # "t1" or "t2"
+
+    def _key(self, symbol: str) -> str:
+        return f"ml:{self._tier}:features:{symbol}"
+
+    async def append(self, symbol: str, fv_dict: Dict[str, Any]) -> int:
+        key = self._key(symbol)
+        payload = json.dumps(fv_dict)
+        pipe = self._redis.pipeline()
+        try:
+            pipe.rpush(key, payload)
+            pipe.ltrim(key, -self.MAX_WINDOW, -1)
+            pipe.expire(key, self.REDIS_TTL)
+            pipe.llen(key)
+            results = await pipe.execute()
+            return int(results[-1])
+        finally:
+            await pipe.reset()
+
+    async def get_all(self, symbol: str) -> List[Dict[str, Any]]:
+        key = self._key(symbol)
+        raw = await self._redis.lrange(key, 0, -1)
+        out = []
+        for r in raw:
+            try:
+                out.append(json.loads(r))
             except Exception:
                 pass
         return out
@@ -682,3 +814,268 @@ class EnsembleSignalEngine:
             except Exception as exc:
                 logger.error("Retrain loop error: %s", exc, exc_info=True)
             await asyncio.sleep(300)   # Check every 5 min
+
+
+# ---------------------------------------------------------------------------
+# TierSignalEngine — Multi-tier signal generation
+# ---------------------------------------------------------------------------
+
+class TierSignalEngine:
+    """
+    Multi-tier signal engine that wraps the original EnsembleSignalEngine
+    and adds Tier-1 (microstructure) and Tier-2 (mean-reversion) signal paths.
+
+    This is an ADDITIVE layer — the original engine continues to work unchanged.
+    The TierSignalEngine delegates to the original for backward-compat and
+    provides separate predict methods for each tier.
+    """
+
+    # Tier-1: 5-min forward return (vs original 1-min)
+    TIER1_LABEL_DELAY_S = 300
+    # Tier-2: 30-min forward return
+    TIER2_LABEL_DELAY_S = 1800
+    RETRAIN_INTERVAL_S = 1800
+
+    def __init__(self, redis_client: aioredis.Redis,
+                 original_engine: EnsembleSignalEngine) -> None:
+        self._original = original_engine
+        self._redis = redis_client
+
+        # Tier-1 stores and models
+        self._t1_store = TieredFeatureStore(redis_client, "t1")
+        self._t1_xgb: Dict[str, XGBoostLearner] = {}
+        self._t1_ridge: Dict[str, RidgeLearner] = {}
+        self._t1_meta: Dict[str, MetaLearner] = {}
+        self._t1_last_retrain: Dict[str, float] = {}
+        self._t1_pending: Dict[str, Deque[Tier1FeatureVector]] = {}
+
+        # Tier-2 stores and models
+        self._t2_store = TieredFeatureStore(redis_client, "t2")
+        self._t2_xgb: Dict[str, XGBoostLearner] = {}
+        self._t2_ridge: Dict[str, RidgeLearner] = {}
+        self._t2_meta: Dict[str, MetaLearner] = {}
+        self._t2_last_retrain: Dict[str, float] = {}
+        self._t2_pending: Dict[str, Deque[Tier2FeatureVector]] = {}
+
+    # -- Tier-1 methods --
+
+    def enqueue_tier1(self, symbol: str, fv: Tier1FeatureVector) -> None:
+        """Enqueue a Tier-1 FV for delayed labeling."""
+        if symbol not in self._t1_pending:
+            self._t1_pending[symbol] = deque()
+        self._t1_pending[symbol].append(fv)
+
+    async def label_tier1(self, symbol: str, current_price: float) -> None:
+        """Label mature Tier-1 FVs (5-min delay) and store."""
+        queue = self._t1_pending.get(symbol)
+        if not queue:
+            return
+        now = time.monotonic()
+        while queue:
+            fv = queue[0]
+            if now - fv.reference_ts < self.TIER1_LABEL_DELAY_S:
+                break
+            if fv.reference_price > 0 and current_price > 0:
+                fv.fwd_log_return = round(math.log(current_price / fv.reference_price), 8)
+                await self._t1_store.append(symbol, fv.to_dict())
+            queue.popleft()
+
+    def predict_tier1(self, symbol: str, fv: Tier1FeatureVector) -> SignalOutput:
+        """Generate Tier-1 signal from microstructure features."""
+        xgb_m = self._t1_xgb.get(symbol)
+        ridge_m = self._t1_ridge.get(symbol)
+        meta_m = self._t1_meta.get(symbol)
+
+        if not (xgb_m and xgb_m.is_fitted and ridge_m and ridge_m.is_fitted):
+            # Fallback: use MLOFI + aggressive flow as simple directional signal
+            raw = 0.6 * fv.mlofi + 0.4 * fv.aflow_ratio
+            signal = max(-1.0, min(1.0, raw))
+            return SignalOutput(
+                symbol=symbol, signal=round(signal, 6), confidence=0.25,
+                xgb_pred=0.0, ridge_pred=signal, meta_pred=signal,
+                feature_importances={}, model_version="t1-fallback",
+                is_fallback=True,
+            )
+
+        x = np.array(fv.to_array(), dtype=np.float32)
+        xgb_pred = xgb_m.predict(x)
+        ridge_pred = ridge_m.predict(x)
+        meta_pred = meta_m.predict(xgb_pred, ridge_pred) if meta_m else (xgb_pred + ridge_pred) / 2.0
+
+        signal = max(-1.0, min(1.0, meta_pred * 20.0))
+        agreement = 1.0 - min(abs(xgb_pred - ridge_pred) / (abs(xgb_pred) + abs(ridge_pred) + 1e-9), 1.0)
+        confidence = round(agreement * abs(signal), 4)
+        importances = xgb_m.feature_importances(Tier1FeatureVector.FEATURE_NAMES)
+
+        return SignalOutput(
+            symbol=symbol, signal=round(signal, 6), confidence=confidence,
+            xgb_pred=round(xgb_pred, 8), ridge_pred=round(ridge_pred, 8),
+            meta_pred=round(meta_pred, 8), feature_importances=importances,
+            model_version=f"t1-{self._t1_last_retrain.get(symbol, 0):.0f}",
+            is_fallback=False,
+        )
+
+    # -- Tier-2 methods (same pattern) --
+
+    def enqueue_tier2(self, symbol: str, fv: Tier2FeatureVector) -> None:
+        if symbol not in self._t2_pending:
+            self._t2_pending[symbol] = deque()
+        self._t2_pending[symbol].append(fv)
+
+    async def label_tier2(self, symbol: str, current_price: float) -> None:
+        queue = self._t2_pending.get(symbol)
+        if not queue:
+            return
+        now = time.monotonic()
+        while queue:
+            fv = queue[0]
+            if now - fv.reference_ts < self.TIER2_LABEL_DELAY_S:
+                break
+            if fv.reference_price > 0 and current_price > 0:
+                fv.fwd_log_return = round(math.log(current_price / fv.reference_price), 8)
+                await self._t2_store.append(symbol, fv.to_dict())
+            queue.popleft()
+
+    def predict_tier2(self, symbol: str, fv: Tier2FeatureVector) -> SignalOutput:
+        xgb_m = self._t2_xgb.get(symbol)
+        ridge_m = self._t2_ridge.get(symbol)
+        meta_m = self._t2_meta.get(symbol)
+
+        if not (xgb_m and xgb_m.is_fitted and ridge_m and ridge_m.is_fitted):
+            # Fallback: VWAP z-score mean-reversion + RSI signal
+            raw = -0.5 * fv.vwap_z / 5.0 + 0.5 * fv.rsi_mr_signal
+            signal = max(-1.0, min(1.0, raw))
+            return SignalOutput(
+                symbol=symbol, signal=round(signal, 6), confidence=0.20,
+                xgb_pred=0.0, ridge_pred=signal, meta_pred=signal,
+                feature_importances={}, model_version="t2-fallback",
+                is_fallback=True,
+            )
+
+        x = np.array(fv.to_array(), dtype=np.float32)
+        xgb_pred = xgb_m.predict(x)
+        ridge_pred = ridge_m.predict(x)
+        meta_pred = meta_m.predict(xgb_pred, ridge_pred) if meta_m else (xgb_pred + ridge_pred) / 2.0
+
+        signal = max(-1.0, min(1.0, meta_pred * 20.0))
+        agreement = 1.0 - min(abs(xgb_pred - ridge_pred) / (abs(xgb_pred) + abs(ridge_pred) + 1e-9), 1.0)
+        confidence = round(agreement * abs(signal), 4)
+        importances = xgb_m.feature_importances(Tier2FeatureVector.FEATURE_NAMES)
+
+        return SignalOutput(
+            symbol=symbol, signal=round(signal, 6), confidence=confidence,
+            xgb_pred=round(xgb_pred, 8), ridge_pred=round(ridge_pred, 8),
+            meta_pred=round(meta_pred, 8), feature_importances=importances,
+            model_version=f"t2-{self._t2_last_retrain.get(symbol, 0):.0f}",
+            is_fallback=False,
+        )
+
+    # -- Retraining --
+
+    async def maybe_retrain_tier1(self, symbol: str) -> bool:
+        now = time.monotonic()
+        if now - self._t1_last_retrain.get(symbol, 0.0) < self.RETRAIN_INTERVAL_S:
+            return False
+        if not await self._t1_store.ready(symbol):
+            return False
+
+        raw_dicts = await self._t1_store.get_all(symbol)
+        fvs = [Tier1FeatureVector.from_dict(d) for d in raw_dicts]
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None, self._retrain_tier_sync, symbol, fvs,
+            Tier1FeatureVector.FEATURE_NAMES,
+            self._t1_xgb, self._t1_ridge, self._t1_meta,
+        )
+        self._t1_last_retrain[symbol] = now
+        logger.info("Tier-1 retrained %s", symbol)
+        return True
+
+    async def maybe_retrain_tier2(self, symbol: str) -> bool:
+        now = time.monotonic()
+        if now - self._t2_last_retrain.get(symbol, 0.0) < self.RETRAIN_INTERVAL_S:
+            return False
+        if not await self._t2_store.ready(symbol):
+            return False
+
+        raw_dicts = await self._t2_store.get_all(symbol)
+        fvs = [Tier2FeatureVector.from_dict(d) for d in raw_dicts]
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None, self._retrain_tier_sync, symbol, fvs,
+            Tier2FeatureVector.FEATURE_NAMES,
+            self._t2_xgb, self._t2_ridge, self._t2_meta,
+        )
+        self._t2_last_retrain[symbol] = now
+        logger.info("Tier-2 retrained %s", symbol)
+        return True
+
+    @staticmethod
+    def _retrain_tier_sync(
+        symbol: str,
+        fvs: list,
+        feature_names: List[str],
+        xgb_dict: Dict[str, XGBoostLearner],
+        ridge_dict: Dict[str, RidgeLearner],
+        meta_dict: Dict[str, MetaLearner],
+    ) -> None:
+        """CPU-bound retraining for any tier — runs in thread executor."""
+        if not _ML_READY:
+            return
+
+        labelled = [fv for fv in fvs if fv.fwd_log_return is not None]
+        if len(labelled) < FeatureStore.MIN_TRAIN:
+            return
+
+        X = np.array([fv.to_array() for fv in labelled], dtype=np.float32)
+        y = np.array([fv.fwd_log_return for fv in labelled], dtype=np.float32)
+        y = np.clip(y, -0.05, 0.05)
+
+        split = max(int(len(labelled) * 0.80), FeatureStore.MIN_TRAIN)
+        split = min(split, len(labelled) - 10)
+
+        # Holdout stacking (same as original)
+        xgb_train = XGBoostLearner()
+        ridge_train = RidgeLearner()
+        xgb_train.fit(X[:split], y[:split])
+        ridge_train.fit(X[:split], y[:split])
+
+        holdout_xgb = np.array([xgb_train.predict(X[i]) for i in range(split, len(labelled))])
+        holdout_ridge = np.array([ridge_train.predict(X[i]) for i in range(split, len(labelled))])
+        X_meta_train = np.column_stack([holdout_xgb, holdout_ridge])
+        y_meta = y[split:]
+
+        meta_model = MetaLearner()
+        if len(X_meta_train) >= 10:
+            meta_model.fit(X_meta_train, y_meta)
+
+        xgb_model = XGBoostLearner()
+        ridge_model = RidgeLearner()
+        xgb_model.fit(X, y)
+        ridge_model.fit(X, y)
+
+        xgb_dict[symbol] = xgb_model
+        ridge_dict[symbol] = ridge_model
+        meta_dict[symbol] = meta_model
+
+    # -- Convenience: delegate to original engine --
+
+    @property
+    def original(self) -> EnsembleSignalEngine:
+        return self._original
+
+    async def run_retrain_loop(self, symbols: List[str]) -> None:
+        """Background task: retrain all tiers for all symbols."""
+        logger.info("TierSignalEngine retrain loop started (%d symbols).", len(symbols))
+        while True:
+            try:
+                for sym in symbols:
+                    await self.maybe_retrain_tier1(sym)
+                    await self.maybe_retrain_tier2(sym)
+                    await asyncio.sleep(0.1)
+            except asyncio.CancelledError:
+                logger.info("TierSignalEngine retrain loop cancelled.")
+                raise
+            except Exception as exc:
+                logger.error("TierSignalEngine retrain loop error: %s", exc, exc_info=True)
+            await asyncio.sleep(300)
