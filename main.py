@@ -514,6 +514,16 @@ async def strategy_loop(
     portfolio_risk: Optional["PortfolioRiskMonitor"] = None,  # R-13
     digest_scheduler: Optional[Any] = None,                   # Task-7
     loop_state_holder: Any = None,                            # Task-7
+    # --- Profitability Plan ---
+    tier_engine: Optional[Any] = None,
+    regime_detector: Optional[Any] = None,
+    tier_router: Optional[Any] = None,
+    filter_funnel: Optional[Any] = None,
+    trade_attribution: Optional[Any] = None,
+    signal_distribution: Optional[Any] = None,
+    micro_states: Optional[Dict] = None,
+    mr_states: Optional[Dict] = None,
+    news_blackout_mgr: Optional[Any] = None,
 ) -> None:
     """
     Main evaluation loop with:
@@ -1074,6 +1084,21 @@ async def strategy_loop(
 
         # ---- Per-symbol signal evaluation ----
         actionable_count = 0
+
+        # --- Profitability Plan: regime detection ---
+        _pp_active_tiers = []
+        if regime_detector is not None and tier_router is not None:
+            try:
+                _ist_now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+                _pp_hour, _pp_min = _ist_now.hour, _ist_now.minute
+                _pp_no_trade = is_no_trade_zone(_pp_hour, _pp_min)
+                from regime_detector import MarketRegime
+                _pp_regime = regime_detector.regime
+                _pp_active_tiers = tier_router.route(_pp_regime, _pp_hour, _pp_min, _pp_no_trade)
+            except Exception as _pp_exc:
+                logger.debug("Regime routing error: %s", _pp_exc)
+                _pp_active_tiers = []
+
         for symbol in active_symbols:
             price = ltp_map.get(symbol, 0.0)
             if price <= 0:
@@ -1101,8 +1126,123 @@ async def strategy_loop(
                         symbol, sig.ml_signal, sig.direction.value,
                         sig.quantity, sig.is_actionable, sig.is_decayed,
                     )
+
+                # --- Profitability Plan: tier feature computation ---
+                if tier_engine is not None and micro_states is not None:
+                    try:
+                        # Initialize per-symbol state if needed
+                        if symbol not in micro_states:
+                            from features.microstructure import MicrostructureState
+                            micro_states[symbol] = MicrostructureState(symbol=symbol)
+                        if mr_states is not None and symbol not in mr_states:
+                            from features.mean_reversion import MeanReversionState
+                            mr_states[symbol] = MeanReversionState(symbol=symbol)
+
+                        _ms = micro_states[symbol]
+                        # Compute Tier-1 features from available data
+                        _t1_feats = compute_tier1_features(
+                            state=_ms,
+                            mlofi=sig.mlofi if hasattr(sig, 'mlofi') else 0.0,
+                            aflow_ratio=sig.aflow_ratio if hasattr(sig, 'aflow_ratio') else 0.0,
+                            best_bid=price * 0.999,   # approximate from price
+                            best_ask=price * 1.001,
+                        )
+                        # Build Tier-1 FV and enqueue for labeling
+                        _t1_fv = Tier1FeatureVector(
+                            mlofi=_t1_feats.get("mlofi", 0.0),
+                            obi_momentum=_t1_feats.get("obi_momentum", 0.0),
+                            aflow_ratio=_t1_feats.get("aflow_ratio", 0.0),
+                            trade_arrival_rate=_t1_feats.get("trade_arrival_rate", 1.0),
+                            spread_z=_t1_feats.get("spread_z", 0.0),
+                            vwpp=_t1_feats.get("vwpp", 0.0),
+                            ret_1min=_t1_feats.get("ret_1min", 0.0),
+                            ret_5min=_t1_feats.get("ret_5min", 0.0),
+                            reference_price=price,
+                        )
+                        tier_engine.enqueue_tier1(symbol, _t1_fv)
+                        await tier_engine.label_tier1(symbol, price)
+
+                        # Compute Tier-2 features
+                        if mr_states is not None:
+                            from features.seasonality import time_of_day_features as _tod
+                            _ist_now_t2 = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+                            _time_feats = _tod(_ist_now_t2.hour, _ist_now_t2.minute)
+                            _mrs = mr_states[symbol]
+                            # Update ORB from first 3 candles
+                            if not _mrs.orb_set and _mrs.orb_candle_count < 3:
+                                _mrs.orb_high = max(_mrs.orb_high, price)
+                                _mrs.orb_low = min(_mrs.orb_low, price)
+                                _mrs.orb_candle_count += 1
+                                if _mrs.orb_candle_count >= 3:
+                                    _mrs.orb_set = True
+
+                            _t2_feats = compute_tier2_features(
+                                state=_mrs,
+                                price=price,
+                                vwap=sig.vwap if hasattr(sig, 'vwap') else price,
+                                rsi=sig.rsi if hasattr(sig, 'rsi') else 50.0,
+                                stock_ret_15min=_t1_feats.get("ret_15min", 0.0) if "ret_15min" in _t1_feats else 0.0,
+                                sector_avg_ret_15min=0.0,
+                                time_features=_time_feats,
+                            )
+                            _t2_fv = Tier2FeatureVector(
+                                vwap_z=_t2_feats.get("vwap_z", 0.0),
+                                rsi_mr_signal=_t2_feats.get("rsi_mr_signal", 0.0),
+                                sector_rs=_t2_feats.get("sector_rs", 0.0),
+                                orb_position=_t2_feats.get("orb_position", 0.5),
+                                time_sin=_t2_feats.get("time_sin", 0.0),
+                                time_cos=_t2_feats.get("time_cos", 0.0),
+                                ret_15min=_t2_feats.get("ret_15min", 0.0),
+                                vol_normalised=_t2_feats.get("vol_normalised", 0.2),
+                                aflow_ratio_15min=_t2_feats.get("aflow_ratio_15min", 0.0),
+                                reference_price=price,
+                            )
+                            tier_engine.enqueue_tier2(symbol, _t2_fv)
+                            await tier_engine.label_tier2(symbol, price)
+
+                        # Get tier predictions and potentially override the original signal
+                        from tier_router import StrategyTier
+                        if _pp_active_tiers:
+                            _best_signal = sig.ml_signal if hasattr(sig, 'ml_signal') else 0.0
+                            _best_conf = sig.ml_confidence if hasattr(sig, 'ml_confidence') else 0.0
+                            _tier_used = "original"
+
+                            if StrategyTier.TIER1_MICRO in _pp_active_tiers:
+                                _t1_out = tier_engine.predict_tier1(symbol, _t1_fv)
+                                if not _t1_out.is_fallback and abs(_t1_out.signal) > abs(_best_signal):
+                                    _best_signal = _t1_out.signal
+                                    _best_conf = _t1_out.confidence
+                                    _tier_used = "tier1"
+
+                            if StrategyTier.TIER2_MEANREV in _pp_active_tiers and mr_states is not None:
+                                _t2_out = tier_engine.predict_tier2(symbol, _t2_fv)
+                                if not _t2_out.is_fallback and abs(_t2_out.signal) > abs(_best_signal):
+                                    _best_signal = _t2_out.signal
+                                    _best_conf = _t2_out.confidence
+                                    _tier_used = "tier2"
+
+                            # If a tier model produced a stronger signal, log it
+                            if _tier_used != "original":
+                                logger.debug(
+                                    "PP %s: %s signal=%.4f conf=%.4f overrides original=%.4f",
+                                    symbol, _tier_used, _best_signal, _best_conf,
+                                    sig.ml_signal if hasattr(sig, 'ml_signal') else 0.0,
+                                )
+
+                    except Exception as _pp_err:
+                        logger.debug("PP feature computation error for %s: %s", symbol, _pp_err)
+
+                # --- Profitability Plan: signal distribution tracking ---
+                if signal_distribution is not None and hasattr(sig, 'ml_signal'):
+                    try:
+                        signal_distribution.add(abs(sig.ml_signal))
+                    except Exception:
+                        pass
+
                 if sig.is_actionable:
                     actionable_count += 1
+                    if filter_funnel is not None:
+                        filter_funnel.record("passed_alpha_gate")
 
                     # ── Telegram trade guards (/nobuy, /nosell) ────────────
                     if (bot_state and bot_state.no_new_buys
@@ -1110,12 +1250,16 @@ async def strategy_loop(
                         logger.info(
                             "TradeGuard[nobuy]: skipping BUY signal for %s", symbol
                         )
+                        if filter_funnel is not None:
+                            filter_funnel.record("blocked_nobuy_guard")
                         continue
                     if (bot_state and bot_state.no_new_sells
                             and sig.direction == TradeDirection.SELL):
                         logger.info(
                             "TradeGuard[nosell]: skipping SELL signal for %s", symbol
                         )
+                        if filter_funnel is not None:
+                            filter_funnel.record("blocked_nosell_guard")
                         continue
 
                     # ── R-13: Symbol blacklist (consecutive-loss guard) ────
@@ -1124,6 +1268,8 @@ async def strategy_loop(
                             "R-13 blacklist: skipping %s (consecutive losses today)",
                             symbol,
                         )
+                        if filter_funnel is not None:
+                            filter_funnel.record("blocked_risk_blacklist")
                         continue
 
                     # ── Task-9: News-event blackout gate ───────────────────
@@ -1137,6 +1283,8 @@ async def strategy_loop(
                                 "Task-9 NewsBlackout: skipping %s %s (%.0f s left)",
                                 sig.direction.value, symbol, _nb_rem,
                             )
+                            if filter_funnel is not None:
+                                filter_funnel.record("blocked_news_blackout")
                             continue
                     except Exception as _nbexc:
                         logger.debug("NewsBlackout gate failed: %s", _nbexc)
@@ -1150,6 +1298,8 @@ async def strategy_loop(
                             "Cooldown: skipping %s %s (%.0f s left before re-entry allowed)",
                             sig.direction.value, symbol, remaining,
                         )
+                        if filter_funnel is not None:
+                            filter_funnel.record("blocked_cooldown")
                         continue
 
                     # ── Position guard ─────────────────────────────────────
@@ -1159,12 +1309,16 @@ async def strategy_loop(
                             "Position guard: already LONG %s (qty=%d) — skipping BUY signal",
                             symbol, net_qty,
                         )
+                        if filter_funnel is not None:
+                            filter_funnel.record("blocked_position_guard_long")
                         continue
                     if net_qty < 0 and sig.direction == TradeDirection.SELL:
                         logger.info(
                             "Position guard: already SHORT %s (qty=%d) — skipping SELL signal",
                             symbol, net_qty,
                         )
+                        if filter_funnel is not None:
+                            filter_funnel.record("blocked_position_guard_short")
                         continue
 
                     # ── Task-5: Sector correlation cap (BUY entries only) ───
@@ -1188,6 +1342,8 @@ async def strategy_loop(
                             _sc_reason = ""
                         if _blocked:
                             logger.warning("Task-5 SECTOR CAP: %s", _sc_reason)
+                            if filter_funnel is not None:
+                                filter_funnel.record("blocked_sector_cap")
                             try:
                                 await telegram.send_message(
                                     f"⛔ <b>Sector cap block</b>\n{_sc_reason}\n"
@@ -1207,12 +1363,16 @@ async def strategy_loop(
                         sentiment_class=sentiment.sentiment_classification,
                         gri_level=gri.level, gri=gri.composite,
                     ), name="tg_signal")
+                    if filter_funnel is not None:
+                        filter_funnel.record("passed_all_gates")
                     report = await executor.execute(sig)
 
                     # Set cooldown so this symbol is blocked for SIGNAL_COOLDOWN_S
                     if report.success:
                         _order_cooldowns[symbol] = time.monotonic()
-                        
+                        if filter_funnel is not None:
+                            filter_funnel.record("orders_executed")
+
                         # R-12: Register new position with manager.
                         # Bug 2.4 fix — forward σ_ann so stops are vol-scaled.
                         pos_manager.on_trade_executed(
@@ -1444,6 +1604,13 @@ async def main(kite: KiteConnect, access_token: str, tg_offset: int = 0) -> None
     tg_controller.set_digest_provider(_digest_provider)
     # R-14: Wire broker-balance fetcher so /balance and /synccapital work.
     tg_controller.set_margin_fetcher(executor.get_margins)
+
+    # --- Profitability Plan: Telegram diagnostic providers ---
+    tg_controller.set_filter_funnel(filter_funnel)
+    tg_controller.set_regime_detector(regime_detector)
+    tg_controller.set_calibration_tracker(calibration_tracker)
+    tg_controller.set_feature_importance_tracker(feature_importance_tracker)
+    tg_controller.set_signal_distribution(signal_distribution)
 
     print_banner("Geopolitical Risk Feed")
     await geo_monitor.initialise()
@@ -1699,6 +1866,15 @@ async def main(kite: KiteConnect, access_token: str, tg_offset: int = 0) -> None
             portfolio_risk=portfolio_risk_monitor,  # R-13
             digest_scheduler=digest_scheduler,       # Task-7
             loop_state_holder=_strategy_loop_state_holder,  # Task-7
+            tier_engine=tier_engine,
+            regime_detector=regime_detector,
+            tier_router=tier_router,
+            filter_funnel=filter_funnel,
+            trade_attribution=trade_attribution,
+            signal_distribution=signal_distribution,
+            micro_states=micro_states,
+            mr_states=mr_states,
+            news_blackout_mgr=news_blackout_mgr,
         ), name="strategy_loop",
     )
     sentiment_task    = asyncio.create_task(sentiment_loop(), name="sentiment_loop")
