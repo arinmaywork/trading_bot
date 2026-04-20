@@ -716,6 +716,15 @@ async def strategy_loop(
         active_symbols = universe_engine.get_active_symbols()
         if not active_symbols:
             logger.warning("Empty universe — waiting for initialisation.")
+            # FIX: Update bot_state even when universe is empty so /status
+            # doesn't freeze with stale data (was skipping ALL updates via continue).
+            if bot_state:
+                from agent_pipeline import _rotator as _gm_rotator  # noqa: PLC0415
+                bot_state.update(
+                    active_symbols=0,
+                    top_symbols=[],
+                    gemini_working=not _gm_rotator.all_on_cooldown(),
+                )
             await asyncio.sleep(5)
             continue
 
@@ -845,6 +854,9 @@ async def strategy_loop(
 
         # FIX B-18 (Bug #5): Update bot_state with live GRI/sentiment BEFORE any
         # continue statements so /status always reflects current data.
+        # FIX: Use ModelRotator.all_on_cooldown() for gemini_working — the old
+        # sentiment_score!=0.0 check conflated quota exhaustion with transient errors.
+        from agent_pipeline import _rotator as _gm_rotator  # noqa: PLC0415
         if bot_state:
             bot_state.update(
                 last_gri=gri.composite, last_gri_level=gri.level,
@@ -854,7 +866,7 @@ async def strategy_loop(
                 last_alpha_mult=gri.alpha_multiplier,
                 last_kelly_mult=gri.kelly_multiplier,
                 gemini_working=(bot_state.mode.value != "gri_only" and
-                                sentiment.sentiment_score != 0.0),
+                                not _gm_rotator.all_on_cooldown()),
             )
 
         # ── Apply trading mode guards ──────────────────────────────────
@@ -1863,29 +1875,61 @@ async def main(kite: KiteConnect, access_token: str, tg_offset: int = 0) -> None
     geo_tasks      = await geo_monitor.start_background_tasks()
     universe_tasks = await universe_engine.start_background_tasks()
 
+    # Crash-resilient wrapper: if strategy_loop hits an uncaught exception,
+    # log it, notify via Telegram, wait 30s, and restart the loop.  Without
+    # this, one unhandled error permanently kills the strategy task while
+    # the process stays alive — leaving /status frozen with stale data.
+    _strat_kwargs = dict(
+        kite=kite, redis_client=redis_client, alt_data=alt_data,
+        geo_monitor=geo_monitor, universe_engine=universe_engine,
+        strategy_engine=strategy_engine, executor=executor,
+        rate_limiter=rate_limiter, freq_optimiser=freq_optimiser,
+        ws_manager=ws_manager,
+        telegram=telegram,
+        pos_manager=pos_manager,
+        logbook=logbook, bot_state=bot_state,
+        portfolio_risk=portfolio_risk_monitor,
+        digest_scheduler=digest_scheduler,
+        loop_state_holder=_strategy_loop_state_holder,
+        tier_engine=tier_engine,
+        regime_detector=regime_detector,
+        tier_router=tier_router,
+        filter_funnel=filter_funnel,
+        trade_attribution=trade_attribution,
+        signal_distribution=signal_distribution,
+        micro_states=micro_states,
+        mr_states=mr_states,
+        news_blackout_mgr=news_blackout_mgr,
+    )
+    async def _resilient_strategy_loop():
+        _crash_count = 0
+        while True:
+            try:
+                await strategy_loop(**_strat_kwargs)
+                break  # clean exit (shouldn't happen — strategy_loop is while True)
+            except asyncio.CancelledError:
+                raise  # honour graceful shutdown
+            except Exception as _fatal:
+                _crash_count += 1
+                logger.critical(
+                    "STRATEGY LOOP CRASHED (attempt #%d): %s",
+                    _crash_count, _fatal, exc_info=True,
+                )
+                try:
+                    await telegram.send(
+                        f"🔥 <b>Strategy loop crashed</b> (attempt #{_crash_count})\n"
+                        f"<code>{type(_fatal).__name__}: {_fatal}</code>\n"
+                        f"Auto-restarting in 30s…"
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(30)
+                if _crash_count >= 50:
+                    logger.critical("Strategy loop crashed %d times — giving up.", _crash_count)
+                    break
+
     strat_task = asyncio.create_task(
-        strategy_loop(
-            kite=kite, redis_client=redis_client, alt_data=alt_data,
-            geo_monitor=geo_monitor, universe_engine=universe_engine,
-            strategy_engine=strategy_engine, executor=executor,
-            rate_limiter=rate_limiter, freq_optimiser=freq_optimiser,
-            ws_manager=ws_manager,
-            telegram=telegram,  # B-01 FIX: pass telegram notifier
-            pos_manager=pos_manager, # R-12: Risk management
-            logbook=logbook, bot_state=bot_state,
-            portfolio_risk=portfolio_risk_monitor,  # R-13
-            digest_scheduler=digest_scheduler,       # Task-7
-            loop_state_holder=_strategy_loop_state_holder,  # Task-7
-            tier_engine=tier_engine,
-            regime_detector=regime_detector,
-            tier_router=tier_router,
-            filter_funnel=filter_funnel,
-            trade_attribution=trade_attribution,
-            signal_distribution=signal_distribution,
-            micro_states=micro_states,
-            mr_states=mr_states,
-            news_blackout_mgr=news_blackout_mgr,
-        ), name="strategy_loop",
+        _resilient_strategy_loop(), name="strategy_loop",
     )
     sentiment_task    = asyncio.create_task(sentiment_loop(), name="sentiment_loop")
     token_watch_task  = asyncio.create_task(_token_watch_loop(), name="token_watcher")
