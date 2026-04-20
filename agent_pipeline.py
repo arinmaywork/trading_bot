@@ -141,21 +141,27 @@ class ModelRotator:
     #   gemini-1.5-flash     — deprecated (returns 404)
     #   gemini-1.5-pro       — deprecated (returns 404)
     #
-    # Current free-tier models (April 2026) — FIX B-17:
-    #   ACTUAL project limits (read from Google AI Studio Rate Limit dashboard,
-    #   NOT the documented defaults which apply only to paid/billing-enabled tiers).
+    # Current free-tier models (April 2026) — updated from dashboard screenshot.
     #
-    #   gemini-2.5-flash      → 15 RPM, 1500 RPD
-    #   gemini-2.5-flash-lite → 15 RPM, 1500 RPD
-    #   gemini-2.5-pro        → 5 RPM,  50 RPD
+    #   IMPORTANT: Google reduced free-tier limits significantly in mid-2026.
+    #   The old values (1500 RPD, 15 RPM) are no longer valid.
+    #   Current limits per Google AI Studio Rate Limit dashboard (Apr 20 2026):
+    #
+    #   gemini-2.5-flash      →  5 RPM,  25 RPD
+    #   gemini-2.5-flash-lite → 10 RPM,  25 RPD
+    #   gemini-2.5-pro        →  5 RPM,  25 RPD
     #
     # NOTE: If you set up billing, update these values to reflect the raised limits
     # shown in the Google AI Studio dashboard. The rpd_limit here is set with a
-    # 5-10% safety margin to avoid hitting the wall.
+    # small safety margin to avoid hitting the wall.
+    #
+    # With 25 RPD per model (75 total across 3 models), and 375-minute market day,
+    # the MINIMUM viable polling interval is ~300s (5 min) to stay under budget.
+    # recommended_interval_s() has been updated accordingly.
     _POOL: List[_ModelSlot] = [
-        _ModelSlot("gemini-2.5-flash",      "2.5 Flash",      quality=4, rpm_limit=15, rpd_limit=1400, tier="flash"),
-        _ModelSlot("gemini-2.5-flash-lite",  "2.5 Flash-Lite", quality=3, rpm_limit=15, rpd_limit=1400, tier="flash"),
-        _ModelSlot("gemini-2.5-pro",         "2.5 Pro",        quality=5, rpm_limit=5,  rpd_limit=45,   tier="pro"),
+        _ModelSlot("gemini-2.5-flash",      "2.5 Flash",      quality=4, rpm_limit=5,  rpd_limit=23, tier="flash"),
+        _ModelSlot("gemini-2.5-flash-lite",  "2.5 Flash-Lite", quality=3, rpm_limit=10, rpd_limit=23, tier="flash"),
+        _ModelSlot("gemini-2.5-pro",         "2.5 Pro",        quality=5, rpm_limit=5,  rpd_limit=23, tier="pro"),
     ]
 
     # Cooldowns: separate RPM vs RPD exhaustion
@@ -438,25 +444,25 @@ class ModelRotator:
         """
         Recommended sleep between sentiment cycles.
 
-        Recalibrated for free-tier limits (1400 RPD for Flash).
+        Recalibrated for reduced free-tier limits (25 RPD per model, ~69 total).
         NSE market day = 375 minutes (09:15 – 15:30 IST).
-        With 1400 RPD, we can comfortably poll every 1 minute (375 calls/day)
-        and still have 1000+ calls left for other services or long sessions.
-        
-        However, to avoid local RPM spikes and respect the smaller Pro quota (45 RPD),
-        we use these intervals:
+        With ~69 total RPD across 3 models, we need to be very conservative.
+        Target: max ~50 calls/day to leave headroom for retries and Pro calls.
+        At 480s (8 min) default → 375/8 = ~47 calls/day — fits budget.
+
+        Only accelerate during high-risk periods; otherwise conserve.
         """
         now  = time.time()
         ist  = datetime.fromtimestamp(now, tz=_IST)
         hour = ist.hour + ist.minute / 60.0
 
-        if 9.25 <= hour <= 9.75:   return 180    # Opening  — 3 min
-        if 15.0 <= hour <= 15.5:   return 180    # Pre-close — 3 min
-        if gri_composite >= 0.65:  return 120    # EXTREME risk
-        if gri_composite >= 0.50:  return 180    # HIGH risk
-        if gri_composite >= 0.30:  return 300    # ELEVATED (default) — 5 min
-        if gri_composite >= 0.15:  return 480    # MODERATE
-        return 600                             # LOW
+        if 9.25 <= hour <= 9.75:   return 360    # Opening  — 6 min (conservative)
+        if 15.0 <= hour <= 15.5:   return 360    # Pre-close — 6 min
+        if gri_composite >= 0.65:  return 300    # EXTREME risk — 5 min
+        if gri_composite >= 0.50:  return 420    # HIGH risk — 7 min
+        if gri_composite >= 0.30:  return 480    # ELEVATED (default) — 8 min
+        if gri_composite >= 0.15:  return 600    # MODERATE — 10 min
+        return 900                             # LOW — 15 min
 
     def can_afford_risk_manager(self) -> bool:
         """

@@ -1434,10 +1434,20 @@ async def strategy_loop(
                             mode=bot_state.mode.value if bot_state else "unknown"
                         ), name="tg_quota")
                 else:
+                    # FIX: Reset latch when models recover — allows re-notification
+                    # if quota exhausts again after a recovery period.
+                    _quota_notified = False
                     logger.warning(
                         "Sentiment=0.0 — Gemini call failed (non-quota issue: "
                         "network/parse error or stale result). Bot will retry next cycle."
                     )
+
+        # FIX: Derive gemini_working from ModelRotator state, NOT sentiment score.
+        # sentiment_score==0.0 conflates quota exhaustion with network/parse errors.
+        # ModelRotator.all_on_cooldown() is the authoritative source of truth for
+        # whether Gemini is actually unavailable.
+        from agent_pipeline import _rotator as _gm_rotator  # noqa: PLC0415
+        _gemini_actually_working = not _gm_rotator.all_on_cooldown()
 
         if bot_state:
             bot_state.update(
@@ -1449,7 +1459,7 @@ async def strategy_loop(
                 last_kelly_mult=gri.kelly_multiplier,
                 active_symbols=len(active_symbols),
                 top_symbols=list(active_symbols[:3]),
-                gemini_working=sentiment.sentiment_score != 0.0,
+                gemini_working=_gemini_actually_working,
             )
             bot_state.signals_today += actionable_count
 
