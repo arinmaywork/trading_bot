@@ -1699,7 +1699,13 @@ async def main(kite: KiteConnect, access_token: str, tg_offset: int = 0) -> None
 
     # Telegram mode selector
     asyncio.create_task(tg_controller.poll_loop(), name="tg_poll")
-    
+
+    # FIX: Set gemini_working from ModelRotator BEFORE mode selector runs.
+    # Without this, bot_state.gemini_working defaults to False and the mode
+    # selector always warns "Gemini quota exhausted" on fresh startup.
+    from agent_pipeline import _rotator as _startup_rotator  # noqa: PLC0415
+    bot_state.gemini_working = not _startup_rotator.all_on_cooldown()
+
     async def _mode_init_task():
         await tg_controller.send_mode_selector()
         chosen_mode = await tg_controller.wait_for_mode(timeout_s=120)

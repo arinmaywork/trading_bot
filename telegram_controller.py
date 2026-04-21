@@ -347,7 +347,15 @@ class TelegramController:
         # Show Gemini quota state honestly so the user can pick the right mode
         gri_val = self._state.last_gri
         gri_emoji = "🟢" if gri_val < 0.30 else ("🟡" if gri_val < 0.50 else "🔴")
-        if self._state.gemini_working:
+        # Check ModelRotator directly — bot_state flag may be stale at startup
+        _gemini_ok = self._state.gemini_working
+        if not _gemini_ok:
+            try:
+                from agent_pipeline import _rotator as _mr
+                _gemini_ok = not _mr.all_on_cooldown()
+            except Exception:
+                pass
+        if _gemini_ok:
             gemini_status = "✅ Gemini quota available — Full mode recommended"
         else:
             gemini_status = "⚠️ Gemini quota exhausted — GRI-Only recommended"
@@ -398,12 +406,23 @@ class TelegramController:
         )
         # Bug fix: in GRI-only mode Gemini is intentionally not used — show that
         # clearly instead of the alarming "Quota exhausted" message.
+        # FIX: Also check ModelRotator directly as a live fallback — bot_state
+        # flag can be stale if strategy loop hasn't cycled yet.
         if s.mode == TradingMode.GRI_ONLY:
             gemini_str = "⚡ Not used (GRI-synthetic mode)"
         elif s.gemini_working:
             gemini_str = "✅ Working"
         else:
-            gemini_str = "❌ Quota exhausted"
+            # Double-check ModelRotator live state before showing "exhausted"
+            try:
+                from agent_pipeline import _rotator as _live_rotator
+                if not _live_rotator.all_on_cooldown():
+                    gemini_str = "✅ Working"
+                    s.gemini_working = True  # Fix the stale flag
+                else:
+                    gemini_str = "❌ Quota exhausted"
+            except Exception:
+                gemini_str = "❌ Quota exhausted"
         elapsed = _ist_now() - s.start_time
         hours, rem = divmod(int(elapsed.total_seconds()), 3600)
         mins = rem // 60
