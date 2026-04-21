@@ -1070,7 +1070,7 @@ class TelegramController:
                 await self.send("⚠️ Filter funnel not initialized.")
             else:
                 try:
-                    await self.send(self._filter_funnel.format_funnel(), parse_mode="HTML")
+                    await self.send(self._filter_funnel.format_funnel())
                 except Exception as exc:
                     logger.error("/funnel error: %s", exc, exc_info=True)
                     await self.send(f"❌ Funnel report failed: <code>{exc}</code>")
@@ -1093,7 +1093,7 @@ class TelegramController:
                         f"Bollinger BW: {state.bollinger_bw:.4f}\n"
                         f"Vol (1h): {state.realised_vol_1h:.4f}"
                     )
-                    await self.send(text, parse_mode="HTML")
+                    await self.send(text)
                 except Exception as exc:
                     logger.error("/regime error: %s", exc, exc_info=True)
                     await self.send(f"❌ Regime report failed: <code>{exc}</code>")
@@ -1104,7 +1104,7 @@ class TelegramController:
                 await self.send("⚠️ Model health tracker not initialized.")
             else:
                 try:
-                    await self.send(self._calibration_tracker.format_health(), parse_mode="HTML")
+                    await self.send(self._calibration_tracker.format_health())
                 except Exception as exc:
                     logger.error("/model_health error: %s", exc, exc_info=True)
                     await self.send(f"❌ Model health report failed: <code>{exc}</code>")
@@ -1119,7 +1119,6 @@ class TelegramController:
                     symbol = parts[1].strip().upper() if len(parts) > 1 else None
                     await self.send(
                         self._feature_importance_tracker.format_importance(symbol=symbol),
-                        parse_mode="HTML"
                     )
                 except Exception as exc:
                     logger.error("/features error: %s", exc, exc_info=True)
@@ -1131,7 +1130,7 @@ class TelegramController:
                 await self.send("⚠️ Signal distribution tracker not initialized.")
             else:
                 try:
-                    await self.send(self._signal_distribution.format_distribution(), parse_mode="HTML")
+                    await self.send(self._signal_distribution.format_distribution())
                 except Exception as exc:
                     logger.error("/signals error: %s", exc, exc_info=True)
                     await self.send(f"❌ Signal distribution report failed: <code>{exc}</code>")
