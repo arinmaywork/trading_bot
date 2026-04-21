@@ -11,7 +11,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from statistics import mean, stdev
-from typing import Optional
+from typing import Dict, Optional
 
 
 logger = logging.getLogger(__name__)
@@ -31,6 +31,15 @@ class FunnelSnapshot:
     passed_sector_cap: int = 0  # Sector exposure still under cap
     passed_cooldown: int = 0  # Symbol not in cooldown
     passed_risk_halt: int = 0  # No daily/weekly/monthly halt
+    # Block stages (signal rejected at a specific gate)
+    blocked_nobuy_guard: int = 0     # Buy blocked by no-buy guard
+    blocked_nosell_guard: int = 0    # Sell blocked by no-sell guard
+    blocked_risk_blacklist: int = 0  # Symbol on risk blacklist
+    blocked_news_blackout: int = 0   # Blocked by news blackout
+    blocked_cooldown: int = 0        # Symbol still in order cooldown
+    blocked_position_guard_long: int = 0   # Already long, can't buy more
+    blocked_position_guard_short: int = 0  # Already short, can't sell more
+    blocked_sector_cap: int = 0      # Sector exposure cap breached
     passed_all_gates: int = 0  # Cleared every filter — about to execute
     orders_executed: int = 0  # Actually placed an order
 
@@ -60,13 +69,14 @@ class FilterFunnel:
             ValueError: If stage is not a valid FunnelSnapshot field
         """
         if not hasattr(self._daily_totals, stage):
-            valid_fields = [
-                f for f in self._daily_totals.__dataclass_fields__
-                if not f.startswith("_")
-            ]
-            raise ValueError(
-                f"Invalid stage '{stage}'. Valid stages: {valid_fields}"
-            )
+            # Graceful fallback: log a warning but do NOT raise.
+            # Diagnostics must never crash the trading loop.  Unknown stages
+            # are stored in the overflow dict so they still appear in /funnel.
+            if not hasattr(self, '_overflow'):
+                self._overflow: Dict[str, int] = {}
+            self._overflow[stage] = self._overflow.get(stage, 0) + count
+            logger.warning("FilterFunnel: unknown stage '%s' (overflow +%d)", stage, count)
+            return
 
         current = getattr(self._daily_totals, stage)
         setattr(self._daily_totals, stage, current + count)
