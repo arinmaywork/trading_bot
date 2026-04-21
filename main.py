@@ -509,6 +509,7 @@ async def strategy_loop(
     ws_manager: WebSocketSubscriptionManager,
     telegram: "TelegramNotifier",   # B-01 FIX: was missing from signature
     pos_manager: PositionManager,   # R-12: Added PositionManager
+    risk_manager: Any = None,       # R-11/R-13: capital sync
     logbook: Any = None,
     bot_state: Any = None,
     portfolio_risk: Optional["PortfolioRiskMonitor"] = None,  # R-13
@@ -1887,6 +1888,7 @@ async def main(kite: KiteConnect, access_token: str, tg_offset: int = 0) -> None
         ws_manager=ws_manager,
         telegram=telegram,
         pos_manager=pos_manager,
+        risk_manager=risk_manager,
         logbook=logbook, bot_state=bot_state,
         portfolio_risk=portfolio_risk_monitor,
         digest_scheduler=digest_scheduler,
