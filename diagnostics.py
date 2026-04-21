@@ -31,6 +31,7 @@ class FunnelSnapshot:
     passed_sector_cap: int = 0  # Sector exposure still under cap
     passed_cooldown: int = 0  # Symbol not in cooldown
     passed_risk_halt: int = 0  # No daily/weekly/monthly halt
+    passed_all_gates: int = 0  # Cleared every filter — about to execute
     orders_executed: int = 0  # Actually placed an order
 
 
