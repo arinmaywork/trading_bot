@@ -124,6 +124,9 @@ class SignalState:
             and self.quantity > 0
             and not self.is_decayed
             and abs(self.ml_signal) >= settings.strategy.MIN_ALPHA_THRESHOLD
+            # Tune-3: require minimum confidence 0.50 to filter out low-conviction
+            # fallback signals (hardcoded confidence=0.35)
+            and self.ml_confidence >= 0.50
         )
 
 

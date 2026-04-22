@@ -775,7 +775,8 @@ class EnsembleSignalEngine:
         meta_pred   = meta_model.predict(xgb_pred, ridge_pred) if meta_model else (xgb_pred + ridge_pred) / 2.0
 
         # Scale signal to [−1, 1] (returns are in ~[−0.05, 0.05])
-        signal = max(-1.0, min(1.0, meta_pred * 20.0))
+        # Tune-3: 20× inflated weak predictions past alpha gate; 5× is more conservative
+        signal = max(-1.0, min(1.0, meta_pred * 5.0))
 
         # Confidence: agreement between base learners (correlation proxy)
         agreement = 1.0 - min(abs(xgb_pred - ridge_pred) / (abs(xgb_pred) + abs(ridge_pred) + 1e-9), 1.0)
@@ -902,7 +903,8 @@ class TierSignalEngine:
         ridge_pred = ridge_m.predict(x)
         meta_pred = meta_m.predict(xgb_pred, ridge_pred) if meta_m else (xgb_pred + ridge_pred) / 2.0
 
-        signal = max(-1.0, min(1.0, meta_pred * 20.0))
+        # Tune-3: 20× → 5× (same fix as main predict method)
+        signal = max(-1.0, min(1.0, meta_pred * 5.0))
         agreement = 1.0 - min(abs(xgb_pred - ridge_pred) / (abs(xgb_pred) + abs(ridge_pred) + 1e-9), 1.0)
         confidence = round(agreement * abs(signal), 4)
         importances = xgb_m.feature_importances(Tier1FeatureVector.FEATURE_NAMES)
@@ -957,7 +959,8 @@ class TierSignalEngine:
         ridge_pred = ridge_m.predict(x)
         meta_pred = meta_m.predict(xgb_pred, ridge_pred) if meta_m else (xgb_pred + ridge_pred) / 2.0
 
-        signal = max(-1.0, min(1.0, meta_pred * 20.0))
+        # Tune-3: 20× → 5× (same fix as main predict method)
+        signal = max(-1.0, min(1.0, meta_pred * 5.0))
         agreement = 1.0 - min(abs(xgb_pred - ridge_pred) / (abs(xgb_pred) + abs(ridge_pred) + 1e-9), 1.0)
         confidence = round(agreement * abs(signal), 4)
         importances = xgb_m.feature_importances(Tier2FeatureVector.FEATURE_NAMES)

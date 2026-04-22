@@ -36,7 +36,7 @@ HSL_SIGMA_MULT = 3.0    # hard stop at 3σ
 ACT_SIGMA_MULT = 2.5    # TSL activates at +2.5σ profit
 CBK_SIGMA_MULT = 1.5    # TSL trails 1.5σ below peak
 BARS_PER_YEAR  = 252 * 375
-TIME_STOP_MINUTES = 25  # kill dead trades after 25 minutes of no progress
+TIME_STOP_MINUTES = 45  # Tune-3: 25 min was too short for TSL to engage; 45 min gives positions time to develop
 
 
 @dataclass

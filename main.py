@@ -954,9 +954,25 @@ async def strategy_loop(
                 )
                 report = await executor.execute(exit_sig)
                 if report.success:
-                    # Update local position count and clear cooldown
+                    # Tune-3 FIX: Log exit trades so FIFO P&L matcher sees SELLs
+                    if logbook:
+                        trade_mode = "PAPER" if is_paper_trade() else "LIVE"
+                        await logbook.log_trade(report, exit_sig, trade_mode)
+                    if bot_state:
+                        bot_state.trades_today += 1
+
+                    # Update local position count
                     _open_positions[sym] = 0
-                    if sym in _order_cooldowns:
+
+                    # Tune-3: After a time-stop exit, apply a longer failure cooldown
+                    # (1 hour) to prevent buy→time-stop→buy churn loops.
+                    if "Time-stop" in reason:
+                        _order_cooldowns[sym] = time.monotonic() + settings.strategy.TIME_STOP_FAILURE_COOLDOWN_S - SIGNAL_COOLDOWN_S
+                        logger.info(
+                            "Time-stop failure cooldown: blocking %s for %.0f s",
+                            sym, settings.strategy.TIME_STOP_FAILURE_COOLDOWN_S,
+                        )
+                    elif sym in _order_cooldowns:
                         del _order_cooldowns[sym]
                 else:
                     # Exit failed! Put it back in _open_positions to retry next cycle
@@ -1041,6 +1057,34 @@ async def strategy_loop(
                             "Square-off placed: %s qty=%d @ ₹%.1f (ltp=%.1f) → order_id=%s",
                             sym, close_qty, _sq_price, _ltp, sq_id,
                         )
+                        # Tune-3 FIX: Log live square-off trades for P&L tracking
+                        if logbook:
+                            from strategy import SignalState as _SqSS
+                            from execution import ExecutionReport as _SqER
+                            _sq_dir_td = TradeDirection.SELL if qty > 0 else TradeDirection.BUY
+                            _sq_sig = _SqSS(
+                                symbol=sym, timestamp=datetime.now(timezone.utc),
+                                current_price=_ltp, vwap=_ltp,
+                                ofi=0.0, mlofi=0.0, aflow_ratio=0.0,
+                                sentiment_score=0.0, sentiment_class="SquareOff",
+                                ml_signal=0.0, ml_confidence=1.0, ml_model_version="squareoff",
+                                ml_is_fallback=True, alpha_raw=0.0, alpha=0.0,
+                                direction=_sq_dir_td, quantity=close_qty, position_fraction=0.0,
+                                busseti_f=0.0, vol_regime=0.0, geo_risk=0.0,
+                                geo_level="SquareOff", geo_alpha_multiplier=1.0,
+                                geo_kelly_multiplier=1.0, is_decayed=False,
+                                rationale="3:15 PM Live Square-Off",
+                                product_type=settings.kite.PRODUCT
+                            )
+                            _sq_rpt = _SqER(
+                                symbol=sym, direction=_sq_dir_td.value,
+                                total_quantity=close_qty,
+                                avg_fill_price=_sq_price, expected_price=_ltp,
+                                success=True,
+                            )
+                            await logbook.log_trade(_sq_rpt, _sq_sig, "LIVE")
+                        if bot_state:
+                            bot_state.trades_today += 1
                     except Exception as sq_exc:
                         logger.error("Square-off FAILED for %s: %s", sym, sq_exc)
                         await telegram.send(
@@ -1065,6 +1109,40 @@ async def strategy_loop(
                         for s, q in open_to_close.items()
                     )
                 )
+                # Tune-3 FIX: Log each paper square-off as exit trade for P&L tracking
+                if logbook:
+                    from strategy import SignalState
+                    for _sq_sym, _sq_qty in open_to_close.items():
+                        _sq_dir = TradeDirection.SELL if _sq_qty > 0 else TradeDirection.BUY
+                        _sq_price = ltp_map.get(_sq_sym, 0.0)
+                        _sq_sig = SignalState(
+                            symbol=_sq_sym, timestamp=datetime.now(timezone.utc),
+                            current_price=_sq_price, vwap=_sq_price,
+                            ofi=0.0, mlofi=0.0, aflow_ratio=0.0,
+                            sentiment_score=0.0, sentiment_class="SquareOff",
+                            ml_signal=0.0, ml_confidence=1.0, ml_model_version="squareoff",
+                            ml_is_fallback=True, alpha_raw=0.0, alpha=0.0,
+                            direction=_sq_dir, quantity=abs(_sq_qty), position_fraction=0.0,
+                            busseti_f=0.0, vol_regime=0.0, geo_risk=0.0,
+                            geo_level="SquareOff", geo_alpha_multiplier=1.0,
+                            geo_kelly_multiplier=1.0, is_decayed=False,
+                            rationale="3:15 PM Paper Square-Off",
+                            product_type=settings.kite.PRODUCT
+                        )
+                        # Synthesize a paper fill report
+                        from execution import ExecutionReport
+                        _sq_report = ExecutionReport(
+                            symbol=_sq_sym,
+                            direction=_sq_dir.value,
+                            total_quantity=abs(_sq_qty),
+                            avg_fill_price=_sq_price,
+                            expected_price=_sq_price,
+                            success=True,
+                        )
+                        await logbook.log_trade(_sq_report, _sq_sig, "PAPER")
+                    if bot_state:
+                        bot_state.trades_today += len(open_to_close)
+
                 _open_positions.clear()
                 _strategy_loop_state.squareoff_done_today = True
 
@@ -1332,6 +1410,18 @@ async def strategy_loop(
                         )
                         if filter_funnel is not None:
                             filter_funnel.record("blocked_position_guard_short")
+                        continue
+
+                    # ── Tune-3: Max concurrent positions guard ─────────────
+                    _active_pos_count = sum(1 for _v in _open_positions.values() if _v != 0)
+                    if _active_pos_count >= settings.strategy.MAX_CONCURRENT_POSITIONS:
+                        logger.info(
+                            "Max positions guard: %d/%d positions open — skipping %s %s",
+                            _active_pos_count, settings.strategy.MAX_CONCURRENT_POSITIONS,
+                            sig.direction.value, symbol,
+                        )
+                        if filter_funnel is not None:
+                            filter_funnel.record("blocked_max_positions")
                         continue
 
                     # ── Task-5: Sector correlation cap (BUY entries only) ───

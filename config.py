@@ -243,7 +243,7 @@ class StrategyConfig:
     USE_DYNAMIC_UNIVERSE: bool = field(
         default_factory=lambda: _optional("USE_DYNAMIC_UNIVERSE", "true").lower() == "true"
     )
-    KELLY_FRACTION:              float = 0.50   # Used as fallback only; Busseti is primary
+    KELLY_FRACTION:              float = 0.25   # Quarter-Kelly (was 0.50); conservative until edge is validated
     MAX_POSITION_FRACTION:       float = 0.05
     # Tune-1: was 0.005. Backtests showed 1000+ trades / gross ≈ 0 — model
     # overpredicts realised P&L by ~30×. Raising to 1.5% so only signals that
@@ -251,19 +251,29 @@ class StrategyConfig:
     # Tune-2: 0.005 → 0.015 was too aggressive (1-8 trades / 90d). Eased
     # to 0.008 — still 60% tighter than original, should yield ~100-300
     # trades / 90d while filtering the weakest noise.
+    # Tune-3 (Day-1 post-mortem): 0.008 still let 48/50 symbols through.
+    # Model overpredicts by ~30×, so 2% is the minimum for a meaningful forecast.
     MIN_ALPHA_THRESHOLD:         float = field(
-        default_factory=lambda: float(_optional("MIN_ALPHA_THRESHOLD", "0.008"))
+        default_factory=lambda: float(_optional("MIN_ALPHA_THRESHOLD", "0.020"))
     )
     # Tune-2: 5.0 was too tight (killed virtually all entries). Eased to
     # 3.0 — still 50% stricter than original 2.0.
+    # Tune-3: 3.0× insufficient with 30× overprediction. 6.0× ensures positive
+    # realised EV even after model error.
     COST_HURDLE_MULTIPLIER:      float = field(
-        default_factory=lambda: float(_optional("COST_HURDLE_MULTIPLIER", "3.0"))
+        default_factory=lambda: float(_optional("COST_HURDLE_MULTIPLIER", "6.0"))
     )
     VOL_SPIKE_THRESHOLD:         float = 2.0
     GEOPOLITICAL_RISK_THRESHOLD: float = 0.65
-    VWAP_LOOKBACK:               int   = 30
+    VWAP_LOOKBACK:               int   = 120   # Tune-3: 30 min tracked price too closely; 120 min gives real trend
     OFI_STRONG_BUY_THRESHOLD:    float = 0.30
     OFI_STRONG_SELL_THRESHOLD:   float = -0.30
+    # Tune-3: Day 1 entered 48 positions simultaneously. Cap at 8 to concentrate
+    # edge and reduce cost burn.
+    MAX_CONCURRENT_POSITIONS:    int   = 8
+    # Tune-3: After a time-stop exit, apply a longer cooldown (1 hour) to prevent
+    # re-entry churn. The standard SIGNAL_COOLDOWN_S (5 min) is too short.
+    TIME_STOP_FAILURE_COOLDOWN_S: float = 3600.0   # 1 hour
     TOTAL_CAPITAL:               float = field(
         default_factory=lambda: float(_optional("TOTAL_CAPITAL", "500000"))
     )
@@ -319,15 +329,17 @@ class StrategyConfig:
     # winners gave back 0.3 % the moment they hit 0.6 %, losers ran 1.2 %.
     # New profile widens the trail and tightens the hard stop so a 50/50
     # signal mix is at least neutral EV before any edge is added.
+    # Tune-3 (Day-1 post-mortem): 0.4% activation exceeded median 25-min price
+    # movement, so TSL never engaged. 0.15% is achievable in 5-10 min.
     TSL_ACTIVATION_PCT:   float = field(
-        default_factory=lambda: float(_optional("TSL_ACTIVATION_PCT", "0.004"))
-    )   # 0.4% activates trail (was 0.6%)
+        default_factory=lambda: float(_optional("TSL_ACTIVATION_PCT", "0.0015"))
+    )   # 0.15% activates trail (was 0.4%)
     TSL_CALLBACK_PCT:     float = field(
-        default_factory=lambda: float(_optional("TSL_CALLBACK_PCT", "0.005"))
-    )   # 0.5% trailing buffer (was 0.3%)
+        default_factory=lambda: float(_optional("TSL_CALLBACK_PCT", "0.003"))
+    )   # 0.3% trailing buffer (was 0.5%) — tighter to lock in more profit
     HARD_STOP_LOSS_PCT:   float = field(
-        default_factory=lambda: float(_optional("HARD_STOP_LOSS_PCT", "0.008"))
-    )   # 0.8% hard stop (was 1.2%)
+        default_factory=lambda: float(_optional("HARD_STOP_LOSS_PCT", "0.005"))
+    )   # 0.5% hard stop (was 0.8%) — cut losers faster
 
     # ---------------------------------------------------------------------------
     # R-11: CNC / MIS Hybrid Strategy
@@ -450,8 +462,9 @@ class StrategyConfig:
     ALPHA_PERCENTILE_WINDOW:      int   = 200    # Rolling observations per symbol
     # Tune-2: 0.95 was too aggressive (combined with other gates, killed
     # almost everything). Eased to 0.92 — still tighter than original 0.90.
+    # Tune-3: 92nd percentile still too permissive. Only trade top 3% of signals.
     ALPHA_PERCENTILE:             float = field(
-        default_factory=lambda: float(_optional("ALPHA_PERCENTILE", "0.92"))
+        default_factory=lambda: float(_optional("ALPHA_PERCENTILE", "0.97"))
     )
     ALPHA_MIN_OBSERVATIONS:       int   = 30     # Fall back to static until this many seen
     # Never let the adaptive threshold drop below the static minimum — this
@@ -463,7 +476,7 @@ class StrategyConfig:
         default_factory=lambda: _optional("CONFIDENCE_KELLY_ENABLED", "true").lower() == "true"
     )
     CONFIDENCE_KELLY_TARGET:      float = 0.70   # Full Kelly at conf ≥ 0.70
-    CONFIDENCE_KELLY_FLOOR:       float = 0.30   # Never shrink below 30% of computed Kelly
+    CONFIDENCE_KELLY_FLOOR:       float = 0.10   # Tune-3: 30%→10%; fallback signals (conf=0.35) get minimal capital
 
     # ---------------------------------------------------------------------------
     # Task-5: Sector correlation cap + intraday MTM drawdown stop

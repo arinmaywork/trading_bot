@@ -40,6 +40,7 @@ class FunnelSnapshot:
     blocked_position_guard_long: int = 0   # Already long, can't buy more
     blocked_position_guard_short: int = 0  # Already short, can't sell more
     blocked_sector_cap: int = 0      # Sector exposure cap breached
+    blocked_max_positions: int = 0   # Tune-3: Max concurrent positions limit reached
     passed_all_gates: int = 0  # Cleared every filter — about to execute
     orders_executed: int = 0  # Actually placed an order
 
