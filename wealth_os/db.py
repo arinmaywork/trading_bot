@@ -55,6 +55,23 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+CREATE TABLE IF NOT EXISTS goals (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    name          TEXT UNIQUE NOT NULL,
+    target_amount REAL NOT NULL,
+    target_date   TEXT NOT NULL,
+    priority      INTEGER DEFAULT 5,
+    created_at    TEXT
+);
+CREATE TABLE IF NOT EXISTS recommendations (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT,
+    kind       TEXT,
+    title      TEXT,
+    detail     TEXT,
+    status     TEXT DEFAULT 'pending',
+    decided_at TEXT
+);
 """
 
 
@@ -163,6 +180,55 @@ def mf_holdings() -> list[sqlite3.Row]:
     with connect() as con:
         return con.execute(
             "SELECT * FROM mf_holdings WHERE units > 0.001 ORDER BY value DESC"
+        ).fetchall()
+
+
+def add_goal(name: str, amount: float, target_date: str, priority: int = 5) -> None:
+    with connect() as con:
+        con.execute(
+            "INSERT INTO goals (name,target_amount,target_date,priority,created_at) "
+            "VALUES (?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET "
+            "target_amount=excluded.target_amount, target_date=excluded.target_date, "
+            "priority=excluded.priority",
+            (name, amount, target_date, priority, _now()),
+        )
+
+
+def delete_goal(name: str) -> int:
+    with connect() as con:
+        return con.execute("DELETE FROM goals WHERE name=?", (name,)).rowcount
+
+
+def list_goals() -> list[sqlite3.Row]:
+    with connect() as con:
+        return con.execute(
+            "SELECT * FROM goals ORDER BY priority, target_date"
+        ).fetchall()
+
+
+def add_recommendation(kind: str, title: str, detail: str) -> int:
+    with connect() as con:
+        cur = con.execute(
+            "INSERT INTO recommendations (created_at,kind,title,detail) VALUES (?,?,?,?)",
+            (_now(), kind, title, detail),
+        )
+        return cur.lastrowid
+
+
+def decide_recommendation(rec_id: int, status: str) -> sqlite3.Row | None:
+    with connect() as con:
+        con.execute(
+            "UPDATE recommendations SET status=?, decided_at=? WHERE id=?",
+            (status, _now(), rec_id),
+        )
+        return con.execute(
+            "SELECT * FROM recommendations WHERE id=?", (rec_id,)).fetchone()
+
+
+def pending_recommendations() -> list[sqlite3.Row]:
+    with connect() as con:
+        return con.execute(
+            "SELECT * FROM recommendations WHERE status='pending' ORDER BY id"
         ).fetchall()
 
 

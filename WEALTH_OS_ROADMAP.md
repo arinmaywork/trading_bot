@@ -51,14 +51,14 @@ checkpoint, commit WIP, resume later with the task's resume prompt.
 - Deferred: MF holdings-overlap analysis (needs scheme portfolio disclosures —
   fold into T8 research stack). Equity XIRR needs tradebook import → T6.
 
-## T5 — Goals, SIP allocator, rebalance recommendations
-- `wealth_os/goals.py` — goals table, required-SIP math, surplus allocator (₹50k+/mo),
-  5/25 rebalance bands, new-money-first rebalancing.
-- Recommendation cards with APPROVE/REJECT inline buttons; approved actions logged.
-  (Execution stays manual or via Kite order placement — free personal API.)
-- Checkpoints: (1) goal math, (2) drift detection, (3) approval workflow round-trip.
-
-**Resume prompt:** Resume Wealth OS T5 (goals). Read WEALTH_OS_ROADMAP.md T5 + analytics.py. Build goals.py + inline-button approval flow in bot.py.
+## T5 — Goals, SIP allocator, rebalance recommendations ✅ COMPLETE (2026-07-03)
+- `wealth_os/goals.py` — required-SIP math (verified by FV round-trip), corpus
+  waterfall by priority, monthly surplus allocator, 5/25 bands with
+  new-money-first logic (sell only if gap > ~6 months of surplus, with tax warning).
+- Commands: `/goal add Name 25L 5 [prio]`, `/goal del`, `/goals` (funded bars),
+  `/plan`, `/rebalance`, `/recs`, `/surplus`, `/target 65 20 10 5`.
+- Recommendations table + inline ✅/❌ buttons; decisions logged with timestamp;
+  card edits in place to show APPROVED/REJECTED. Owner-locked callbacks.
 
 ## T6 — Tax module
 - LTCG ₹1.25L/yr harvest recommendations; tax-loss harvesting (Dec–Mar); STCG/LTCG

@@ -17,7 +17,7 @@ from pathlib import Path
 import aiohttp
 import pytz
 
-from . import analytics, db, kite_sync, nav_fetch
+from . import analytics, db, goals, kite_sync, nav_fetch
 from .cas_import import CASImportError, import_cas
 from .kite_sync import KiteAuthError
 
@@ -37,6 +37,12 @@ HELP = (
     "/sync — refresh holdings + cash from Zerodha\n"
     "/networth — total across MF + equity + cash\n"
     "/health — XIRR, allocation vs target, risk flags\n"
+    "/goals — goal progress | /goal add Name 25L 5 [prio]\n"
+    "/plan — split monthly surplus across goals\n"
+    "/rebalance — 5/25 drift check → approval cards\n"
+    "/recs — pending recommendations\n"
+    "/surplus 60000 — set monthly investable surplus\n"
+    "/target 65 20 10 5 — set eq/debt/gold/cash %\n"
     "/refresh — pull latest MF NAVs from AMFI\n"
     "/digest — today's summary (auto-fires 18:30 IST daily)\n"
     "/login — get today's Zerodha login URL\n"
@@ -82,12 +88,16 @@ class WealthBot:
         try:
             while True:
                 try:
-                    updates = await self.api("getUpdates", offset=offset,
-                                             timeout=50, allowed_updates=["message"])
+                    updates = await self.api(
+                        "getUpdates", offset=offset, timeout=50,
+                        allowed_updates=["message", "callback_query"])
                     for u in updates or []:
                         offset = u["update_id"] + 1
                         try:
-                            await self._handle(u.get("message") or {})
+                            if cq := u.get("callback_query"):
+                                await self._handle_callback(cq)
+                            else:
+                                await self._handle(u.get("message") or {})
                         except Exception:
                             log.exception("handler error")
                             await self.send("⚠️ Error handling that — check logs.")
@@ -120,6 +130,21 @@ class WealthBot:
             await self.send(self._networth_card())
         elif text.startswith("/sync"):
             await self._sync_kite()
+        elif text.startswith("/goal "):
+            await self._goal_cmd(text)
+        elif text.startswith("/goals"):
+            await self.send(self._goals_card())
+        elif text.startswith("/plan"):
+            await self.send(self._plan_card())
+        elif text.startswith("/rebalance"):
+            await self._rebalance_cmd()
+        elif text.startswith("/recs"):
+            await self._recs_cmd()
+        elif text.startswith("/surplus"):
+            await self._set_meta_cmd(text, "monthly_surplus",
+                                     "Monthly surplus set to ₹{:,.0f}")
+        elif text.startswith("/target"):
+            await self._target_cmd(text)
         elif text.startswith("/health"):
             card = await asyncio.get_running_loop().run_in_executor(
                 None, analytics.health_card)
@@ -217,6 +242,144 @@ class WealthBot:
             f"{sign} Unrealised P&L: ₹{s['pnl']:,.0f}\n"
             f"Cash: ₹{s['cash']:,.0f}\n\n/networth for the full picture"
         )
+
+    # ── Goals, plan, rebalance, approvals ────────────────────────────
+    @staticmethod
+    def _parse_amt(s: str) -> float:
+        s = s.strip().lower().replace(",", "").replace("₹", "")
+        mult = 1.0
+        if s.endswith("cr"):
+            mult, s = 1e7, s[:-2]
+        elif s.endswith("l"):
+            mult, s = 1e5, s[:-1]
+        elif s.endswith("k"):
+            mult, s = 1e3, s[:-1]
+        return float(s) * mult
+
+    async def _goal_cmd(self, text: str):
+        # /goal add Name 25L 5 [priority]   |   /goal del Name
+        parts = text.split()
+        try:
+            if parts[1] == "del":
+                n = db.delete_goal(parts[2])
+                await self.send("🗑 Deleted." if n else "No goal by that name.")
+                return
+            if parts[1] != "add":
+                raise ValueError
+            name, amount, years = parts[2], self._parse_amt(parts[3]), float(parts[4])
+            prio = int(parts[5]) if len(parts) > 5 else 5
+            target_date = (datetime.now(IST) +
+                           timedelta(days=round(years * 365.25))).strftime("%Y-%m-%d")
+            db.add_goal(name, amount, target_date, prio)
+            sip = goals.required_sip(amount, round(years * 12))
+            await self.send(
+                f"🎯 Goal <b>{html.escape(name)}</b>: ₹{amount:,.0f} by {target_date}"
+                f" (priority {prio})\nRequired SIP from zero: ₹{sip:,.0f}/mo"
+                f" @ {goals.expected_return():.0%} — /goals for funded status")
+        except (IndexError, ValueError):
+            await self.send("Usage: /goal add House 25L 5 [priority]\n"
+                            "       /goal del House")
+
+    def _goals_card(self) -> str:
+        st = goals.goal_status()
+        if not st:
+            return ("No goals yet. Start with an emergency fund:\n"
+                    "/goal add Emergency 3L 1 1")
+        lines = ["<b>🎯 Goals</b> (corpus waterfall by priority)\n"]
+        for g in st:
+            bar = "█" * round(g["funded_pct"] * 10) + "░" * (10 - round(g["funded_pct"] * 10))
+            lines.append(
+                f"<b>{html.escape(g['name'])}</b> — ₹{g['target']:,.0f} by {g['date']}\n"
+                f"{bar} {g['funded_pct']:.0%} funded"
+                + (f" | needs ₹{g['req_sip']:,.0f}/mo" if g["req_sip"] > 0 else " ✅"))
+        return "\n".join(lines)
+
+    def _plan_card(self) -> str:
+        p = goals.monthly_plan()
+        if not p["rows"]:
+            return "No goals to plan for — /goal add first."
+        lines = [f"<b>📆 Monthly Plan — ₹{p['surplus']:,.0f} surplus</b>\n"]
+        for r in p["rows"]:
+            if r["sip"] > 0:
+                lines.append(f"→ ₹{r['sip']:,.0f} to <b>{html.escape(r['name'])}</b>")
+        if p["unallocated"] > 0:
+            lines.append(f"→ ₹{p['unallocated']:,.0f} unallocated — goals fully"
+                         " covered; consider raising targets or equity")
+        lines.append("\nRoute per /rebalance underweights. /surplus to adjust.")
+        return "\n".join(lines)
+
+    async def _rebalance_cmd(self):
+        recos = goals.rebalance_recos()
+        if not recos:
+            await self.send("✅ Allocation within 5/25 bands — nothing to do.")
+            return
+        for r in recos:
+            await self._send_reco(r["kind"], r["title"], r["detail"])
+
+    async def _send_reco(self, kind: str, title: str, detail: str):
+        rec_id = db.add_recommendation(kind, title, detail)
+        await self.api(
+            "sendMessage", chat_id=self.owner, parse_mode="HTML",
+            text=f"💡 <b>#{rec_id} {html.escape(title)}</b>\n\n{html.escape(detail)}",
+            reply_markup={"inline_keyboard": [[
+                {"text": "✅ Approve", "callback_data": f"rec:approved:{rec_id}"},
+                {"text": "❌ Reject", "callback_data": f"rec:rejected:{rec_id}"},
+            ]]})
+
+    async def _handle_callback(self, cq: dict):
+        if (cq.get("from") or {}).get("id") != self.owner:
+            return
+        data = cq.get("data") or ""
+        parts = data.split(":")
+        if len(parts) == 3 and parts[0] == "rec":
+            _, status, rec_id = parts
+            rec = db.decide_recommendation(int(rec_id), status)
+            await self.api("answerCallbackQuery", callback_query_id=cq["id"],
+                           text=f"Recommendation {status}")
+            if rec and (m := cq.get("message")):
+                mark = "✅ APPROVED" if status == "approved" else "❌ REJECTED"
+                await self.api(
+                    "editMessageText", chat_id=self.owner,
+                    message_id=m["message_id"], parse_mode="HTML",
+                    text=f"💡 <b>#{rec['id']} {html.escape(rec['title'])}</b>\n\n"
+                         f"{html.escape(rec['detail'])}\n\n<b>{mark}</b>")
+
+    async def _recs_cmd(self):
+        pend = db.pending_recommendations()
+        if not pend:
+            await self.send("No pending recommendations.")
+            return
+        for r in pend:
+            await self.api(
+                "sendMessage", chat_id=self.owner, parse_mode="HTML",
+                text=f"💡 <b>#{r['id']} {html.escape(r['title'])}</b>\n\n"
+                     f"{html.escape(r['detail'])}",
+                reply_markup={"inline_keyboard": [[
+                    {"text": "✅ Approve", "callback_data": f"rec:approved:{r['id']}"},
+                    {"text": "❌ Reject", "callback_data": f"rec:rejected:{r['id']}"},
+                ]]})
+
+    async def _set_meta_cmd(self, text: str, key: str, ok_fmt: str):
+        try:
+            val = self._parse_amt(text.split()[1])
+        except (IndexError, ValueError):
+            await self.send(f"Usage: /{key.split('_')[1]} 60000")
+            return
+        db.set_meta(key, str(val))
+        await self.send(ok_fmt.format(val))
+
+    async def _target_cmd(self, text: str):
+        try:
+            eq, debt, gold, cash = (float(x) for x in text.split()[1:5])
+            assert abs(eq + debt + gold + cash - 100) < 0.01
+        except (ValueError, AssertionError, IndexError):
+            await self.send("Usage: /target 65 20 10 5 (must sum to 100)")
+            return
+        db.set_meta("target_alloc", json.dumps(
+            {"equity": eq / 100, "debt": debt / 100,
+             "gold": gold / 100, "cash": cash / 100}))
+        await self.send(f"🎯 Target set: {eq:.0f}/{debt:.0f}/{gold:.0f}/{cash:.0f}"
+                        " eq/debt/gold/cash. Run /rebalance to check drift.")
 
     # ── Daily refresh + digest ───────────────────────────────────────
     async def _digest_loop(self):
