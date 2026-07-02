@@ -119,6 +119,16 @@ async def sync(session: aiohttp.ClientSession) -> dict:
         })
     cash = float(((margins.get("equity") or {}).get("net")) or 0)
     db.replace_equity(rows, cash)
+
+    # top day movers (₹ impact on the portfolio), for the daily digest
+    movers = sorted(
+        ({"symbol": h.get("tradingsymbol", "?"),
+          "day_pnl": (h.get("day_change") or 0) * ((h.get("quantity") or 0) + (h.get("t1_quantity") or 0)),
+          "day_pct": h.get("day_change_percentage") or 0}
+         for h in raw if (h.get("quantity") or 0) + (h.get("t1_quantity") or 0) > 0),
+        key=lambda m: abs(m["day_pnl"]), reverse=True,
+    )[:6]
+    db.set_meta("equity_movers", json.dumps(movers))
     return {
         "positions": len(rows),
         "value": sum(r["value"] for r in rows),

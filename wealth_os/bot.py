@@ -9,14 +9,20 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import logging
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import aiohttp
+import pytz
 
-from . import db, kite_sync
+from . import db, kite_sync, nav_fetch
 from .cas_import import CASImportError, import_cas
 from .kite_sync import KiteAuthError
+
+IST = pytz.timezone("Asia/Kolkata")
+DIGEST_HOUR, DIGEST_MIN = 18, 30  # daily digest at 18:30 IST
 
 log = logging.getLogger("wealth_os.bot")
 
@@ -30,6 +36,8 @@ HELP = (
     "/stocks — Zerodha equity holdings\n"
     "/sync — refresh holdings + cash from Zerodha\n"
     "/networth — total across MF + equity + cash\n"
+    "/refresh — pull latest MF NAVs from AMFI\n"
+    "/digest — today's summary (auto-fires 18:30 IST daily)\n"
     "/login — get today's Zerodha login URL\n"
     "/token &lt;request_token&gt; — apply new Kite token\n"
     "/help — this message"
@@ -69,6 +77,7 @@ class WealthBot:
             timeout=aiohttp.ClientTimeout(total=90))
         offset = 0
         await self.send("💰 Wealth OS online. /help for commands.")
+        digest_task = asyncio.create_task(self._digest_loop())
         try:
             while True:
                 try:
@@ -84,6 +93,7 @@ class WealthBot:
                 except (aiohttp.ClientError, asyncio.TimeoutError):
                     await asyncio.sleep(5)
         finally:
+            digest_task.cancel()
             await self._session.close()
 
     # ── Handlers ─────────────────────────────────────────────────────
@@ -109,6 +119,10 @@ class WealthBot:
             await self.send(self._networth_card())
         elif text.startswith("/sync"):
             await self._sync_kite()
+        elif text.startswith("/refresh"):
+            await self._refresh_navs()
+        elif text.startswith("/digest"):
+            await self._daily_digest()
         elif text.startswith("/login"):
             await self._send_login_url()
         elif text.startswith("/token"):
@@ -198,6 +212,77 @@ class WealthBot:
             f"{sign} Unrealised P&L: ₹{s['pnl']:,.0f}\n"
             f"Cash: ₹{s['cash']:,.0f}\n\n/networth for the full picture"
         )
+
+    # ── Daily refresh + digest ───────────────────────────────────────
+    async def _digest_loop(self):
+        while True:
+            now = datetime.now(IST)
+            target = now.replace(hour=DIGEST_HOUR, minute=DIGEST_MIN,
+                                 second=0, microsecond=0)
+            if target <= now:
+                target += timedelta(days=1)
+            await asyncio.sleep((target - now).total_seconds())
+            try:
+                await self._daily_digest()
+            except Exception:
+                log.exception("daily digest failed")
+
+    async def _refresh_navs(self):
+        try:
+            s = await nav_fetch.refresh_mf_navs(self._session)
+        except Exception as e:
+            await self.send(f"❌ AMFI refresh failed: {html.escape(str(e)[:150])}")
+            return None
+        await self.send(
+            f"✅ NAVs refreshed: {s['updated']}/{s['held']} schemes"
+            f" (as of {s['nav_date'] or '?'})")
+        return s
+
+    async def _daily_digest(self):
+        # 1. refresh MF NAVs (best effort)
+        nav_note = ""
+        try:
+            s = await nav_fetch.refresh_mf_navs(self._session)
+            nav_note = f"NAVs: {s['updated']}/{s['held']} as of {s['nav_date'] or '?'}"
+        except Exception as e:
+            nav_note = f"⚠️ NAV refresh failed ({str(e)[:60]})"
+        # 2. refresh equity via Kite if today's token is alive (best effort)
+        eq_note = ""
+        try:
+            await kite_sync.sync(self._session)
+        except KiteAuthError:
+            eq_note = "⚠️ Equity prices stale — /login to refresh"
+        except Exception as e:
+            eq_note = f"⚠️ Equity sync failed ({str(e)[:60]})"
+        # 3. snapshot + day change
+        today = datetime.now(IST).strftime("%Y-%m-%d")
+        n = db.snapshot_networth(today)
+        lines = [f"<b>🌆 Daily Digest — {today}</b>\n",
+                 f"<b>Net worth: ₹{n['total']:,.0f}</b>"]
+        if n["prev_total"]:
+            d = n["total"] - n["prev_total"]
+            pct = d / n["prev_total"] * 100
+            lines.append(f"{'🟢' if d >= 0 else '🔴'} {'+' if d >= 0 else ''}₹{d:,.0f}"
+                         f" ({pct:+.2f}%) since {n['prev_date']}")
+        lines.append(f"\nMF ₹{n['mf']:,.0f} | Equity ₹{n['equity']:,.0f}"
+                     f" | Cash ₹{n['cash']:,.0f}")
+        # 4. equity day movers
+        movers = json.loads(db.get_meta("equity_movers", "[]") or "[]")
+        if movers:
+            lines.append("\n<b>Movers today</b>")
+            for m in movers[:4]:
+                lines.append(f"{'🟢' if m['day_pnl'] >= 0 else '🔴'} "
+                             f"{html.escape(m['symbol'])} ₹{m['day_pnl']:,.0f}"
+                             f" ({m['day_pct']:+.1f}%)")
+        # 5. SIP heads-up (inferred from CAS transaction history)
+        sips = db.recent_sips()
+        if sips:
+            lines.append(f"\n📆 {len(sips)} active SIP(s) detected —"
+                         " keep balance funded")
+        for note in (nav_note, eq_note):
+            if note:
+                lines.append(f"\n{note}")
+        await self.send("\n".join(lines))
 
     # ── Cards ────────────────────────────────────────────────────────
     def _portfolio_card(self) -> str:

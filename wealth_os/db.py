@@ -120,6 +120,45 @@ def replace_equity(rows: list[dict], cash: float) -> None:
         )
 
 
+def update_mf_navs(updates: list[dict]) -> int:
+    """updates: [{isin, nav, nav_date}] → refresh nav + value on held schemes."""
+    with connect() as con:
+        cur = con.executemany(
+            "UPDATE mf_holdings SET nav=:nav, nav_date=:nav_date, "
+            "value=units*:nav, updated_at='%s' WHERE isin=:isin" % _now(),
+            updates,
+        )
+        return cur.rowcount if cur.rowcount != -1 else len(updates)
+
+
+def snapshot_networth(date_ist: str) -> dict:
+    """Persist today's networth breakdown; returns it with day-change vs previous."""
+    n = networth()
+    with connect() as con:
+        prev = con.execute(
+            "SELECT * FROM networth_snapshots WHERE date < ? ORDER BY date DESC LIMIT 1",
+            (date_ist,),
+        ).fetchone()
+        con.execute(
+            "INSERT OR REPLACE INTO networth_snapshots VALUES (?,?,?,?,?)",
+            (date_ist, n["mf"], n["equity"], n["cash"], n["total"]),
+        )
+    n["prev_total"] = prev["total"] if prev else None
+    n["prev_date"] = prev["date"] if prev else None
+    return n
+
+
+def recent_sips(days: int = 45) -> list[sqlite3.Row]:
+    """Schemes with SIP purchases in the last N days → for digest heads-up."""
+    with connect() as con:
+        return con.execute(
+            "SELECT scheme, MAX(date) AS last_date, amount FROM mf_transactions "
+            "WHERE txn_type LIKE '%SIP%' AND date >= date('now', ?) "
+            "GROUP BY scheme ORDER BY last_date",
+            (f"-{days} days",),
+        ).fetchall()
+
+
 def mf_holdings() -> list[sqlite3.Row]:
     with connect() as con:
         return con.execute(

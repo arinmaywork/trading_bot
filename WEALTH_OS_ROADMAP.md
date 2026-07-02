@@ -32,13 +32,14 @@ checkpoint, commit WIP, resume later with the task's resume prompt.
   `/networth` shows MF + equity + broker cash. Auth failure auto-triggers login flow.
 - Mocked sync + token-staleness tests pass.
 
-## T3 — Daily refresh + digest
-- `wealth_os/nav_fetch.py` — AMFI daily NAV feed (free) for MF; yfinance EOD for stocks.
-- Scheduled daily job (18:30 IST): refresh values, snapshot networth to db, Telegram digest
-  (net worth, day change, top movers, upcoming SIPs).
-- Checkpoints: (1) NAV refresh for held ISINs, (2) snapshot table, (3) digest card.
-
-**Resume prompt:** Resume Wealth OS T3 (daily refresh). Read WEALTH_OS_ROADMAP.md T3 + db.py. Build nav_fetch.py and the digest scheduler in bot.py.
+## T3 — Daily refresh + digest ✅ COMPLETE (2026-07-03)
+- `wealth_os/nav_fetch.py` — AMFI NAVAll.txt feed (free), ISIN-matched to held schemes.
+- Equity prices refresh via Kite holdings during digest (no market-data subscription
+  needed); if token stale, digest notes it instead of failing.
+- 18:30 IST daily: NAV refresh → equity sync → networth snapshot → digest card
+  (net worth, day change vs last snapshot, MF/equity/cash split, top equity movers
+  by ₹ day-impact, active-SIP heads-up). `/digest` on demand, `/refresh` for NAVs.
+- Parser + snapshot day-change verified against mocked AMFI feed.
 
 ## T4 — Analytics engine
 - `wealth_os/analytics.py` — XIRR (per scheme, per asset class, total) from mf_transactions;
