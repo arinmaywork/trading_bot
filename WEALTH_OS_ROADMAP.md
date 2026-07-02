@@ -41,14 +41,15 @@ checkpoint, commit WIP, resume later with the task's resume prompt.
   by ₹ day-impact, active-SIP heads-up). `/digest` on demand, `/refresh` for NAVs.
 - Parser + snapshot day-change verified against mocked AMFI feed.
 
-## T4 — Analytics engine
-- `wealth_os/analytics.py` — XIRR (per scheme, per asset class, total) from mf_transactions;
-  asset allocation vs target; MF overlap (via scheme portfolio disclosures); expense-ratio audit
-  (regular vs direct detection); concentration flags.
-- `/health` command → full report card; monthly deep report.
-- Checkpoints: (1) XIRR matches hand-check, (2) allocation vs target, (3) /health renders.
-
-**Resume prompt:** Resume Wealth OS T4 (analytics). Read WEALTH_OS_ROADMAP.md T4 + db.py schema. Build analytics.py; verify XIRR against a hand-computed folio.
+## T4 — Analytics engine ✅ COMPLETE (2026-07-03)
+- `wealth_os/analytics.py` — dependency-free XIRR (bisection; verified against
+  hand-computed and Excel-style cases to <0.01%); per-scheme + total MF XIRR from
+  CAS transactions; keyword scheme classifier (equity/debt/gold/intl/hybrid);
+  allocation vs target (default 65/20/10/5, override via meta `target_alloc`);
+  flags: scheme >25% of MF, AMC >40%, regular plans, stock >10% of net worth.
+- `/health` renders the full card. Hybrid schemes split 65/35 equity/debt.
+- Deferred: MF holdings-overlap analysis (needs scheme portfolio disclosures —
+  fold into T8 research stack). Equity XIRR needs tradebook import → T6.
 
 ## T5 — Goals, SIP allocator, rebalance recommendations
 - `wealth_os/goals.py` — goals table, required-SIP math, surplus allocator (₹50k+/mo),

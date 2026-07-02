@@ -17,7 +17,7 @@ from pathlib import Path
 import aiohttp
 import pytz
 
-from . import db, kite_sync, nav_fetch
+from . import analytics, db, kite_sync, nav_fetch
 from .cas_import import CASImportError, import_cas
 from .kite_sync import KiteAuthError
 
@@ -36,6 +36,7 @@ HELP = (
     "/stocks — Zerodha equity holdings\n"
     "/sync — refresh holdings + cash from Zerodha\n"
     "/networth — total across MF + equity + cash\n"
+    "/health — XIRR, allocation vs target, risk flags\n"
     "/refresh — pull latest MF NAVs from AMFI\n"
     "/digest — today's summary (auto-fires 18:30 IST daily)\n"
     "/login — get today's Zerodha login URL\n"
@@ -119,6 +120,10 @@ class WealthBot:
             await self.send(self._networth_card())
         elif text.startswith("/sync"):
             await self._sync_kite()
+        elif text.startswith("/health"):
+            card = await asyncio.get_running_loop().run_in_executor(
+                None, analytics.health_card)
+            await self.send(card)
         elif text.startswith("/refresh"):
             await self._refresh_navs()
         elif text.startswith("/digest"):

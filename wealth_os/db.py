@@ -166,6 +166,13 @@ def mf_holdings() -> list[sqlite3.Row]:
         ).fetchall()
 
 
+def mf_transactions_all() -> list[sqlite3.Row]:
+    with connect() as con:
+        return con.execute(
+            "SELECT * FROM mf_transactions ORDER BY scheme, date"
+        ).fetchall()
+
+
 def equity_holdings() -> list[sqlite3.Row]:
     with connect() as con:
         return con.execute("SELECT * FROM equity_holdings ORDER BY value DESC").fetchall()
