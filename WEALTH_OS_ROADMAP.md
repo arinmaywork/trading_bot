@@ -25,13 +25,12 @@ checkpoint, commit WIP, resume later with the task's resume prompt.
 
 **Resume prompt:** Resume Wealth OS T1. Read WEALTH_OS_ROADMAP.md T1 and wealth_os/*.py; check which files exist and compile; continue from the first missing piece.
 
-## T2 — Zerodha holdings sync
-- `wealth_os/kite_sync.py` — reuse `.kite_token` flow from old bot; pull `kite.holdings()`
-  + `kite.positions()` into equity_holdings; `/sync` command; `/login` `/token` reuse.
-- `/networth` shows combined MF + equity + cash (kite.margins).
-- Checkpoints: (1) holdings fetch works with cached token, (2) db populated, (3) /networth combined.
-
-**Resume prompt:** Resume Wealth OS T2 (Kite sync). Read WEALTH_OS_ROADMAP.md T2, wealth_os/db.py, and the TokenManager in main.py (legacy). Build kite_sync.py; wire /sync into bot.py.
+## T2 — Zerodha holdings sync ✅ COMPLETE (2026-07-03)
+- `wealth_os/kite_sync.py` — raw Kite REST via aiohttp (no kiteconnect/twisted dep);
+  reuses legacy `.kite_token` cache format; holdings + margins → db.
+- Bot: `/sync`, `/stocks`, `/login`, `/token <request_token>` (token msg auto-deleted);
+  `/networth` shows MF + equity + broker cash. Auth failure auto-triggers login flow.
+- Mocked sync + token-staleness tests pass.
 
 ## T3 — Daily refresh + digest
 - `wealth_os/nav_fetch.py` — AMFI daily NAV feed (free) for MF; yfinance EOD for stocks.

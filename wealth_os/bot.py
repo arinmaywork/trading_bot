@@ -14,8 +14,9 @@ from pathlib import Path
 
 import aiohttp
 
-from . import db
+from . import db, kite_sync
 from .cas_import import CASImportError, import_cas
+from .kite_sync import KiteAuthError
 
 log = logging.getLogger("wealth_os.bot")
 
@@ -26,7 +27,11 @@ HELP = (
     "📄 Send your CAMS/KFintech CAS PDF to import mutual funds\n"
     "     (caption = PDF password, usually your PAN)\n\n"
     "/portfolio — mutual fund holdings\n"
-    "/networth — total across MF + equity\n"
+    "/stocks — Zerodha equity holdings\n"
+    "/sync — refresh holdings + cash from Zerodha\n"
+    "/networth — total across MF + equity + cash\n"
+    "/login — get today's Zerodha login URL\n"
+    "/token &lt;request_token&gt; — apply new Kite token\n"
     "/help — this message"
 )
 
@@ -98,8 +103,22 @@ class WealthBot:
             await self.send(HELP)
         elif text.startswith("/portfolio"):
             await self.send(self._portfolio_card())
+        elif text.startswith("/stocks"):
+            await self.send(self._stocks_card())
         elif text.startswith("/networth"):
             await self.send(self._networth_card())
+        elif text.startswith("/sync"):
+            await self._sync_kite()
+        elif text.startswith("/login"):
+            await self._send_login_url()
+        elif text.startswith("/token"):
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2:
+                await self.send("Usage: /token <request_token>")
+            else:
+                await self.api("deleteMessage", chat_id=self.owner,
+                               message_id=msg["message_id"])
+                await self._apply_token(parts[1].strip())
         elif self._pending_pdf:
             # treat as CAS password; remove it from chat history
             await self.api("deleteMessage", chat_id=self.owner,
@@ -141,6 +160,45 @@ class WealthBot:
             f"<b>MF value: ₹{summary['value']:,.0f}</b>\n\n/portfolio for details"
         )
 
+    # ── Kite sync ────────────────────────────────────────────────────
+    async def _send_login_url(self):
+        try:
+            await self.send(
+                "🔑 <b>Zerodha login</b>\n"
+                f"1️⃣ Open: {kite_sync.login_url()}\n"
+                "2️⃣ Log in, copy <code>request_token</code> from the redirect URL\n"
+                "3️⃣ Send: /token XXXXXXXX"
+            )
+        except KiteAuthError as e:
+            await self.send(f"❌ {html.escape(str(e))}")
+
+    async def _apply_token(self, request_token: str):
+        try:
+            await kite_sync.exchange_request_token(self._session, request_token)
+        except Exception as e:
+            await self.send(f"❌ Token exchange failed: {html.escape(str(e)[:200])}")
+            return
+        await self.send("✅ Kite token saved for today.")
+        await self._sync_kite()
+
+    async def _sync_kite(self):
+        await self.send("⏳ Syncing from Zerodha…")
+        try:
+            s = await kite_sync.sync(self._session)
+        except KiteAuthError:
+            await self._send_login_url()
+            return
+        except Exception as e:
+            await self.send(f"❌ Sync failed: {html.escape(str(e)[:200])}")
+            return
+        sign = "🟢" if s["pnl"] >= 0 else "🔴"
+        await self.send(
+            "✅ <b>Zerodha synced</b>\n"
+            f"Stocks: {s['positions']} | Value: ₹{s['value']:,.0f}\n"
+            f"{sign} Unrealised P&L: ₹{s['pnl']:,.0f}\n"
+            f"Cash: ₹{s['cash']:,.0f}\n\n/networth for the full picture"
+        )
+
     # ── Cards ────────────────────────────────────────────────────────
     def _portfolio_card(self) -> str:
         rows = db.mf_holdings()
@@ -161,14 +219,32 @@ class WealthBot:
         lines.append(f"\nNAVs as of {nav_date} (CAS import)")
         return "\n".join(lines)
 
+    def _stocks_card(self) -> str:
+        rows = db.equity_holdings()
+        if not rows:
+            return "No equity holdings yet — run /sync."
+        total = sum(r["value"] or 0 for r in rows)
+        lines = [f"<b>📈 Zerodha Equity — ₹{total:,.0f}</b>\n"]
+        for r in rows[:30]:
+            pnl = ((r["ltp"] or 0) - (r["avg_price"] or 0)) * (r["qty"] or 0)
+            sign = "🟢" if pnl >= 0 else "🔴"
+            lines.append(
+                f"• <b>{html.escape(r['symbol'])}</b> {r['qty']:.0f} @ ₹{r['avg_price']:,.2f}"
+                f" → ₹{r['ltp']:,.2f}  {sign} ₹{pnl:,.0f}"
+            )
+        sync_at = db.get_meta("last_equity_sync", "never")
+        lines.append(f"\nSynced: {sync_at[:16]}")
+        return "\n".join(lines)
+
     def _networth_card(self) -> str:
         n = db.networth()
-        last = db.get_meta("last_cas_import", "never")
+        cas = db.get_meta("last_cas_import", "never") or "never"
+        eq_sync = db.get_meta("last_equity_sync", "never") or "never"
         return (
             "<b>💼 Net Worth</b>\n\n"
             f"Mutual funds: ₹{n['mf']:,.0f}\n"
-            f"Equity (Zerodha): ₹{n['equity']:,.0f}"
-            f"{'' if n['equity'] else '  (sync coming in T2)'}\n"
+            f"Equity (Zerodha): ₹{n['equity']:,.0f}\n"
+            f"Cash (broker): ₹{n['cash']:,.0f}\n"
             f"<b>Total: ₹{n['total']:,.0f}</b>\n\n"
-            f"Last CAS import: {last[:10]}"
+            f"Last CAS import: {cas[:10]} | Last sync: {eq_sync[:10]}"
         )

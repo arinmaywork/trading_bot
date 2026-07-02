@@ -1,5 +1,5 @@
 # Wealth OS — lean runtime (no ML/tick stack needed)
 aiohttp>=3.9.0
 casparser>=0.7.0
-kiteconnect>=4.2.0    # T2: holdings sync
 pytz>=2024.1
+# NOTE: no kiteconnect — Kite REST is called directly via aiohttp (kite_sync.py)

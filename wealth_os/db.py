@@ -105,6 +105,21 @@ def replace_mf_data(holdings: list[dict], transactions: list[dict], statement_pe
         )
 
 
+def replace_equity(rows: list[dict], cash: float) -> None:
+    now = _now()
+    with connect() as con:
+        con.execute("DELETE FROM equity_holdings")
+        con.executemany(
+            "INSERT INTO equity_holdings VALUES (:symbol,:qty,:avg_price,:ltp,:value,'%s')" % now,
+            rows,
+        )
+        con.execute(
+            "INSERT INTO meta VALUES ('cash',?),('last_equity_sync',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(cash), now),
+        )
+
+
 def mf_holdings() -> list[sqlite3.Row]:
     with connect() as con:
         return con.execute(
@@ -121,4 +136,5 @@ def networth() -> dict:
     with connect() as con:
         mf = con.execute("SELECT COALESCE(SUM(value),0) v FROM mf_holdings WHERE units>0.001").fetchone()["v"]
         eq = con.execute("SELECT COALESCE(SUM(value),0) v FROM equity_holdings").fetchone()["v"]
-    return {"mf": mf, "equity": eq, "total": mf + eq}
+    cash = float(get_meta("cash", "0") or 0)
+    return {"mf": mf, "equity": eq, "cash": cash, "total": mf + eq + cash}
