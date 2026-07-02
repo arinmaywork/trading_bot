@@ -70,11 +70,14 @@ checkpoint, commit WIP, resume later with the task's resume prompt.
   unlocks equity XIRR deferred from T4.
 - Caveats (documented in cards): no pre-2018 grandfathering, no split/bonus adj.
 
-## T7 — Oracle hardening
-- Nightly SQLite backup to Oracle Object Storage (or GitHub private artifact);
-  watchdog systemd timer; log rotation; `/backup` `/status` commands.
-
-**Resume prompt:** Resume Wealth OS T7 (hardening). Read deploy/setup-oracle.sh; add backup timer + watchdog.
+## T7 — Oracle hardening ✅ COMPLETE (2026-07-03)
+- `wealth_os/backup.py` — sqlite online-backup API → gzip → data/backups/
+  (keep 14); nightly 23:00 IST copy sent to your Telegram chat (survives VM loss;
+  restore = gunzip → data/wealth.db). `/backup` on demand.
+- Heartbeat file touched every poll loop; `wealthos-watchdog.timer` (5 min)
+  restarts the service if inactive or heartbeat stale >10 min.
+- Journald capped at 200M (log rotation). `/status`: uptime, db size, token
+  freshness, last import/sync/backup, pending recs.
 
 ## T8 — Swing sleeve (GATED)
 - Nifty-200 momentum+quality monthly screen; validate through existing `backtest/`

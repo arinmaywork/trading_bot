@@ -56,6 +56,40 @@ RestartSec=10
 WantedBy=multi-user.target
 EOF
 
+echo "== 6. Watchdog (restarts service if heartbeat goes stale >10 min) =="
+sudo tee /etc/systemd/system/wealthos-watchdog.service > /dev/null <<EOF
+[Unit]
+Description=Wealth OS heartbeat watchdog
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'f=$DIR/data/heartbeat; \
+  if ! systemctl is-active --quiet wealthos; then systemctl restart wealthos; \
+  elif [ ! -f "\$f" ] || [ \$(( \$(date +%s) - \$(stat -c %Y "\$f") )) -gt 600 ]; then \
+    echo "heartbeat stale, restarting"; systemctl restart wealthos; fi'
+EOF
+
+sudo tee /etc/systemd/system/wealthos-watchdog.timer > /dev/null <<EOF
+[Unit]
+Description=Run Wealth OS watchdog every 5 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+EOF
+
+echo "== 7. Journal size cap (log rotation) =="
+sudo mkdir -p /etc/systemd/journald.conf.d
+sudo tee /etc/systemd/journald.conf.d/wealthos.conf > /dev/null <<EOF
+[Journal]
+SystemMaxUse=200M
+EOF
+sudo systemctl restart systemd-journald
+
 sudo systemctl daemon-reload
 sudo systemctl enable --now wealthos
+sudo systemctl enable --now wealthos-watchdog.timer
 echo "== Done. Logs: sudo journalctl -u wealthos -f =="

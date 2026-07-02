@@ -17,12 +17,14 @@ from pathlib import Path
 import aiohttp
 import pytz
 
-from . import analytics, db, goals, kite_sync, nav_fetch, tax
+from . import analytics, backup, db, goals, kite_sync, nav_fetch, tax
 from .cas_import import CASImportError, import_cas
 from .kite_sync import KiteAuthError
 
 IST = pytz.timezone("Asia/Kolkata")
-DIGEST_HOUR, DIGEST_MIN = 18, 30  # daily digest at 18:30 IST
+DIGEST_HOUR, DIGEST_MIN = 18, 30    # daily digest at 18:30 IST
+BACKUP_HOUR, BACKUP_MIN = 23, 0     # nightly backup at 23:00 IST
+HEARTBEAT = Path(__file__).resolve().parent.parent / "data" / "heartbeat"
 
 log = logging.getLogger("wealth_os.bot")
 
@@ -48,6 +50,8 @@ HELP = (
     "/target 65 20 10 5 — set eq/debt/gold/cash %\n"
     "/refresh — pull latest MF NAVs from AMFI\n"
     "/digest — today's summary (auto-fires 18:30 IST daily)\n"
+    "/status — service health, db, last backup\n"
+    "/backup — snapshot db + send it here\n"
     "/login — get today's Zerodha login URL\n"
     "/token &lt;request_token&gt; — apply new Kite token\n"
     "/help — this message"
@@ -86,10 +90,17 @@ class WealthBot:
         self._session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=90))
         offset = 0
+        self._started = datetime.now(IST)
         await self.send("💰 Wealth OS online. /help for commands.")
         digest_task = asyncio.create_task(self._digest_loop())
+        backup_task = asyncio.create_task(self._backup_loop())
         try:
             while True:
+                try:
+                    HEARTBEAT.parent.mkdir(parents=True, exist_ok=True)
+                    HEARTBEAT.touch()
+                except OSError:
+                    pass
                 try:
                     updates = await self.api(
                         "getUpdates", offset=offset, timeout=50,
@@ -108,6 +119,7 @@ class WealthBot:
                     await asyncio.sleep(5)
         finally:
             digest_task.cancel()
+            backup_task.cancel()
             await self._session.close()
 
     # ── Handlers ─────────────────────────────────────────────────────
@@ -148,6 +160,10 @@ class WealthBot:
                                      "Monthly surplus set to ₹{:,.0f}")
         elif text.startswith("/target"):
             await self._target_cmd(text)
+        elif text.startswith("/status"):
+            await self.send(self._status_card())
+        elif text.startswith("/backup"):
+            await self._do_backup(announce=True)
         elif text.startswith("/tax"):
             card = await asyncio.get_running_loop().run_in_executor(None, tax.tax_card)
             await self.send(card)
@@ -261,6 +277,63 @@ class WealthBot:
             f"Stocks: {s['positions']} | Value: ₹{s['value']:,.0f}\n"
             f"{sign} Unrealised P&L: ₹{s['pnl']:,.0f}\n"
             f"Cash: ₹{s['cash']:,.0f}\n\n/networth for the full picture"
+        )
+
+    # ── Backup + status ──────────────────────────────────────────────
+    async def send_document(self, path: Path, caption: str = ""):
+        form = aiohttp.FormData()
+        form.add_field("chat_id", str(self.owner))
+        if caption:
+            form.add_field("caption", caption)
+        form.add_field("document", path.read_bytes(), filename=path.name)
+        async with self._session.post(f"{self.base}/sendDocument", data=form) as r:
+            data = await r.json()
+        if not data.get("ok"):
+            log.warning("sendDocument failed: %s", data.get("description"))
+        return data.get("ok", False)
+
+    async def _backup_loop(self):
+        while True:
+            now = datetime.now(IST)
+            target = now.replace(hour=BACKUP_HOUR, minute=BACKUP_MIN,
+                                 second=0, microsecond=0)
+            if target <= now:
+                target += timedelta(days=1)
+            await asyncio.sleep((target - now).total_seconds())
+            try:
+                await self._do_backup()
+            except Exception:
+                log.exception("nightly backup failed")
+                await self.send("⚠️ Nightly backup failed — check logs.")
+
+    async def _do_backup(self, announce: bool = False):
+        path = await asyncio.get_running_loop().run_in_executor(
+            None, backup.make_backup)
+        size_kb = path.stat().st_size / 1024
+        ok = await self.send_document(
+            path, caption=f"🗄 Wealth OS backup {path.name} ({size_kb:.0f} KB). "
+                          "Keep this — restore by placing it back as data/wealth.db")
+        if announce and not ok:
+            await self.send("⚠️ Backup created locally but Telegram upload failed.")
+
+    def _status_card(self) -> str:
+        now = datetime.now(IST)
+        up = now - getattr(self, "_started", now)
+        days, rem = divmod(int(up.total_seconds()), 86400)
+        hrs, rem = divmod(rem, 3600)
+        db_size = db.DB_PATH.stat().st_size / 1024 if db.DB_PATH.exists() else 0
+        n = db.networth()
+        token_ok = kite_sync.cached_token() is not None
+        return (
+            "<b>🩺 Status</b>\n\n"
+            f"Uptime: {days}d {hrs}h {rem // 60}m\n"
+            f"DB: {db_size:,.0f} KB | Net worth tracked: ₹{n['total']:,.0f}\n"
+            f"Kite token today: {'✅' if token_ok else '❌ (/login)'}\n"
+            f"Last CAS import: {(db.get_meta('last_cas_import') or 'never')[:10]}\n"
+            f"Last equity sync: {(db.get_meta('last_equity_sync') or 'never')[:10]}\n"
+            f"Last backup: {(db.get_meta('last_backup') or 'never')[:16]}\n"
+            f"Pending recommendations: {len(db.pending_recommendations())}\n"
+            f"Digest 18:30 IST | Backup 23:00 IST | Watchdog: systemd timer"
         )
 
     # ── Goals, plan, rebalance, approvals ────────────────────────────
