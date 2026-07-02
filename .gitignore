@@ -16,3 +16,6 @@ logs/
 backtest/cache/
 backtest/reports/
 !backtest/reports/.gitkeep
+
+# Wealth OS
+data/
