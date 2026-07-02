@@ -60,12 +60,15 @@ checkpoint, commit WIP, resume later with the task's resume prompt.
 - Recommendations table + inline ✅/❌ buttons; decisions logged with timestamp;
   card edits in place to show APPROVED/REJECTED. Owner-locked callbacks.
 
-## T6 — Tax module
-- LTCG ₹1.25L/yr harvest recommendations; tax-loss harvesting (Dec–Mar); STCG/LTCG
-  timing check on every sell recommendation; FY summary for ITR.
-- Checkpoints: (1) FIFO lot engine on mf_transactions + equity, (2) harvest candidates, (3) FY report.
-
-**Resume prompt:** Resume Wealth OS T6 (tax). Read WEALTH_OS_ROADMAP.md T6. Build tax.py using FIFO lots from db transactions.
+## T6 — Tax module ✅ COMPLETE (2026-07-03)
+- `wealth_os/tax.py` — FIFO lot engine (hand-verified) over MF CAS txns + equity
+  tradebook; FY bucketing (Apr–Mar); LTCG 12.5% >₹1.25L, STCG 20%, non-equity → slab flag.
+- `/tax`: FY realized gains + est. tax + equity XIRR (from tradebook).
+- `/harvest`: LTCG-exemption harvesting (per-lot, fills remaining room) +
+  tax-loss candidates with LT/ST label and 30-day rebuy warning.
+- Zerodha Console tradebook CSV import via Telegram upload (idempotent on trade_id);
+  unlocks equity XIRR deferred from T4.
+- Caveats (documented in cards): no pre-2018 grandfathering, no split/bonus adj.
 
 ## T7 — Oracle hardening
 - Nightly SQLite backup to Oracle Object Storage (or GitHub private artifact);

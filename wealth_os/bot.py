@@ -17,7 +17,7 @@ from pathlib import Path
 import aiohttp
 import pytz
 
-from . import analytics, db, goals, kite_sync, nav_fetch
+from . import analytics, db, goals, kite_sync, nav_fetch, tax
 from .cas_import import CASImportError, import_cas
 from .kite_sync import KiteAuthError
 
@@ -31,7 +31,10 @@ CAS_DIR = Path(__file__).resolve().parent.parent / "data" / "cas"
 HELP = (
     "<b>💰 Wealth OS</b>\n\n"
     "📄 Send your CAMS/KFintech CAS PDF to import mutual funds\n"
-    "     (caption = PDF password, usually your PAN)\n\n"
+    "     (caption = PDF password, usually your PAN)\n"
+    "📄 Send your Zerodha Console tradebook CSV for equity tax data\n\n"
+    "/tax — FY capital gains + est. tax + equity XIRR\n"
+    "/harvest — LTCG-exemption + tax-loss opportunities\n"
     "/portfolio — mutual fund holdings\n"
     "/stocks — Zerodha equity holdings\n"
     "/sync — refresh holdings + cash from Zerodha\n"
@@ -145,6 +148,12 @@ class WealthBot:
                                      "Monthly surplus set to ₹{:,.0f}")
         elif text.startswith("/target"):
             await self._target_cmd(text)
+        elif text.startswith("/tax"):
+            card = await asyncio.get_running_loop().run_in_executor(None, tax.tax_card)
+            await self.send(card)
+        elif text.startswith("/harvest"):
+            card = await asyncio.get_running_loop().run_in_executor(None, tax.harvest_card)
+            await self.send(card)
         elif text.startswith("/health"):
             card = await asyncio.get_running_loop().run_in_executor(
                 None, analytics.health_card)
@@ -173,8 +182,19 @@ class WealthBot:
 
     async def _on_document(self, doc: dict, caption: str | None):
         name = doc.get("file_name", "file")
+        if name.lower().endswith(".csv"):
+            path = await self._download(doc["file_id"], CAS_DIR / name)
+            try:
+                s = await asyncio.get_running_loop().run_in_executor(
+                    None, tax.import_tradebook_csv, str(path))
+            except Exception as e:
+                await self.send(f"❌ Tradebook import failed: {html.escape(str(e)[:200])}")
+                return
+            await self.send(f"✅ Tradebook imported: {s['parsed']} trades parsed,"
+                            f" {s['added']} new.\n/tax and /harvest now cover equity.")
+            return
         if not name.lower().endswith(".pdf"):
-            await self.send("I only understand CAS PDFs for now.")
+            await self.send("Send a CAS PDF or a Zerodha tradebook CSV.")
             return
         await self.send(f"📥 Receiving <b>{html.escape(name)}</b>…")
         path = await self._download(doc["file_id"], CAS_DIR / name)

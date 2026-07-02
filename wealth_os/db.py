@@ -55,6 +55,15 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+CREATE TABLE IF NOT EXISTS equity_trades (
+    trade_id   TEXT PRIMARY KEY,
+    symbol     TEXT,
+    isin       TEXT,
+    trade_date TEXT,
+    trade_type TEXT,
+    quantity   REAL,
+    price      REAL
+);
 CREATE TABLE IF NOT EXISTS goals (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     name          TEXT UNIQUE NOT NULL,
@@ -180,6 +189,25 @@ def mf_holdings() -> list[sqlite3.Row]:
     with connect() as con:
         return con.execute(
             "SELECT * FROM mf_holdings WHERE units > 0.001 ORDER BY value DESC"
+        ).fetchall()
+
+
+def insert_equity_trades(rows: list[dict]) -> int:
+    with connect() as con:
+        before = con.execute("SELECT COUNT(*) c FROM equity_trades").fetchone()["c"]
+        con.executemany(
+            "INSERT OR IGNORE INTO equity_trades VALUES "
+            "(:trade_id,:symbol,:isin,:trade_date,:trade_type,:quantity,:price)",
+            rows,
+        )
+        after = con.execute("SELECT COUNT(*) c FROM equity_trades").fetchone()["c"]
+    return after - before
+
+
+def equity_trades_all() -> list[sqlite3.Row]:
+    with connect() as con:
+        return con.execute(
+            "SELECT * FROM equity_trades ORDER BY symbol, trade_date"
         ).fetchall()
 
 
