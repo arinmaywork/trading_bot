@@ -17,7 +17,7 @@ from pathlib import Path
 import aiohttp
 import pytz
 
-from . import analytics, backup, db, goals, kite_sync, nav_fetch, tax
+from . import analytics, backup, db, goals, kite_sync, nav_fetch, swing, tax
 from .cas_import import CASImportError, import_cas
 from .kite_sync import KiteAuthError
 
@@ -50,6 +50,8 @@ HELP = (
     "/target 65 20 10 5 — set eq/debt/gold/cash %\n"
     "/refresh — pull latest MF NAVs from AMFI\n"
     "/digest — today's summary (auto-fires 18:30 IST daily)\n"
+    "/backtest — validate swing sleeve on real EOD data (slow)\n"
+    "/screen — swing picks (locked until gate + 90d paper)\n"
     "/status — service health, db, last backup\n"
     "/backup — snapshot db + send it here\n"
     "/login — get today's Zerodha login URL\n"
@@ -160,6 +162,18 @@ class WealthBot:
                                      "Monthly surplus set to ₹{:,.0f}")
         elif text.startswith("/target"):
             await self._target_cmd(text)
+        elif text.startswith("/backtest"):
+            await self.send("🧪 Downloading ~6y EOD for the universe and running"
+                            " the walk-forward — this can take a few minutes…")
+            try:
+                res = await asyncio.get_running_loop().run_in_executor(
+                    None, swing.run_and_gate)
+                await self.send(swing.report_card(res))
+            except Exception as e:
+                await self.send(f"❌ Backtest failed: {html.escape(str(e)[:200])}\n"
+                                "Is yfinance installed? pip install yfinance pandas")
+        elif text.startswith("/screen"):
+            await self._screen_cmd()
         elif text.startswith("/status"):
             await self.send(self._status_card())
         elif text.startswith("/backup"):
@@ -278,6 +292,44 @@ class WealthBot:
             f"{sign} Unrealised P&L: ₹{s['pnl']:,.0f}\n"
             f"Cash: ₹{s['cash']:,.0f}\n\n/networth for the full picture"
         )
+
+    # ── Swing sleeve (gated) ─────────────────────────────────────────
+    async def _screen_cmd(self):
+        st = swing.gate_status()
+        if not st["gate"]:
+            await self.send("🔒 Swing sleeve locked — no validation run yet.\n"
+                            "Run /backtest first (real data, Sharpe>1.0 required).")
+            return
+        if not st["gate"].get("passed"):
+            await self.send(f"🔒 Swing sleeve locked — last backtest failed the gate"
+                            f" (Sharpe {st['gate']['sharpe']:.2f},"
+                            f" maxDD {st['gate']['maxdd']:.0%}).")
+            return
+        mode = ("LIVE — cap 20% of net worth" if st["live_ok"] else
+                f"PAPER — day {st['paper_days']}/{swing.PAPER_DAYS}; track, don't buy")
+        await self.send(f"⏳ Screening universe… ({mode})")
+        try:
+            picks = await asyncio.get_running_loop().run_in_executor(None, swing.screen)
+        except Exception as e:
+            await self.send(f"❌ Screen failed: {html.escape(str(e)[:200])}")
+            return
+        if not picks:
+            await self.send("No names pass the filters right now (weak tape) —"
+                            " that is information, not a bug. Stay in the core.")
+            return
+        lines = [f"<b>📋 Swing Screen — {mode}</b>\n"]
+        for p in picks:
+            lines.append(f"• <b>{html.escape(p['symbol'])}</b> @ ₹{p['price']:,.1f}"
+                         f" | {p['qty']} sh (₹{p['alloc']:,.0f}) | score {p['score']:.2f}")
+        lines.append("\nEqual-weight, exit on rank>30 at monthly review."
+                     " Approve any trade explicitly — nothing is automatic.")
+        await self.send("\n".join(lines))
+        if st["live_ok"]:
+            await self._send_reco(
+                "swing", "Monthly swing rebalance",
+                f"{len(picks)} names, ₹{picks[0]['alloc'] * len(picks):,.0f} sleeve"
+                " (20% cap). Details in /screen above. Approve to proceed with"
+                " manual/Kite orders.")
 
     # ── Backup + status ──────────────────────────────────────────────
     async def send_document(self, path: Path, caption: str = ""):

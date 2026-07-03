@@ -3,3 +3,6 @@ aiohttp>=3.9.0
 casparser>=0.7.0
 pytz>=2024.1
 # NOTE: no kiteconnect — Kite REST is called directly via aiohttp (kite_sync.py)
+# T8 swing sleeve only (lazy-imported; core bot runs without them):
+yfinance>=0.2.40
+pandas>=2.0.0

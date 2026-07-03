@@ -79,12 +79,25 @@ checkpoint, commit WIP, resume later with the task's resume prompt.
 - Journald capped at 200M (log rotation). `/status`: uptime, db size, token
   freshness, last import/sync/backup, pending recs.
 
-## T8 — Swing sleeve (GATED)
-- Nifty-200 momentum+quality monthly screen; validate through existing `backtest/`
-  walk-forward on ≥5y real EOD data; paper recommendations 3 months; hard 20% cap.
-- Does not start until T1–T5 are live and the backtest gate passes.
+## T8 — Swing sleeve ✅ BUILT (2026-07-03) — 🔒 VALIDATION PENDING ON VM
+- `wealth_os/swing.py` — risk-adjusted 12-1 momentum on Nifty 200 (NSE list at
+  runtime, Nifty-50 fallback); filters: >200DMA + positive momentum; top 15
+  equal-weight, exit rank>30 buffer; 25bps/side costs; 20% sleeve cap.
+- Monthly-rebalance backtester (pandas/yfinance, lazy-imported — core bot stays
+  lean). Mechanics verified on synthetic data; sandbox has no Yahoo/NSE access,
+  so the REAL-data run happens on the VM: `/backtest` or `python -m wealth_os.swing`.
+- Three-stage gate enforced in code: LOCKED → (real backtest Sharpe>1.0,
+  |maxDD|<25%) → PAPER 90 days → LIVE recommendations with approval cards.
+  `/screen` refuses to emit live picks before then.
+- Quality-factor caveat: ROE/accruals need paid fundamentals; trend + low-vol
+  ranking is the free-data approximation (documented in module docstring).
 
-**Resume prompt:** Resume Wealth OS T8 (swing sleeve). Read WEALTH_OS_PIVOT_PLAN.md §4.4 + backtest/engine.py. Build the screen; run walk-forward on real data first.
+---
+
+## Status: ALL TASKS BUILT (T0–T8). Remaining human steps:
+1. VM: `git pull && pip install -r wealth_os/requirements.txt && sudo bash deploy/setup-oracle.sh`
+2. Send CAS PDF + tradebook CSV to the bot; /sync; set /goals /surplus /target
+3. Run /backtest → let the gate decide if the swing sleeve ever goes live
 
 ---
 
