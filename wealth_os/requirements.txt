@@ -1,6 +1,7 @@
 # Wealth OS — lean runtime (no ML/tick stack needed)
 aiohttp>=3.9.0
 casparser==0.8.1
+cryptography<49   # 49 removed ARC4; RC4-encrypted CAS PDFs need it via pdfminer
 pytz>=2024.1
 # pdfplumber (Kuvera PDFs) is installed by setup-oracle.sh in a separate pip
 # pass: its pdfminer pin conflicts with casparser's in a single resolve.

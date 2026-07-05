@@ -233,7 +233,17 @@ class WealthBot:
 
     async def _import(self, path: str, password: str):
         """Try CAS first, then Kuvera; only ask for a password if the PDF
-        is actually encrypted and none was given."""
+        is actually encrypted and none was given. Any unexpected failure is
+        reported with its real message — never a silent 'check logs'."""
+        try:
+            await self._import_inner(path, password)
+        except Exception as e:
+            log.exception("statement import failed")
+            self._pending_pdf = None
+            await self.send(f"❌ Import error ({type(e).__name__}):"
+                            f" {html.escape(str(e)[:300])}")
+
+    async def _import_inner(self, path: str, password: str):
         await self.send("⏳ Parsing statement…")
         loop = asyncio.get_running_loop()
         try:
