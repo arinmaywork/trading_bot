@@ -53,8 +53,9 @@ HELP = (
     "/digest — today's summary (auto-fires 18:30 IST daily)\n"
     "/backtest — validate swing sleeve on real EOD data (slow)\n"
     "/screen — swing picks (locked until gate + 90d paper)\n"
+    "/trend — net worth history sparkline\n"
     "/status — service health, db, last backup\n"
-    "/backup — snapshot db + send it here\n"
+    "/backup — snapshot db + send it here (send a backup back to restore)\n"
     "/login — get today's Zerodha login URL\n"
     "/token &lt;request_token&gt; — apply new Kite token\n"
     "/help — this message"
@@ -65,7 +66,8 @@ class WealthBot:
     def __init__(self, token: str, owner_chat_id: int):
         self.base = f"https://api.telegram.org/bot{token}"
         self.owner = int(owner_chat_id)
-        self._pending_pdf: str | None = None  # path awaiting password
+        self._pending_pdf: str | None = None      # path awaiting password
+        self._pending_restore: str | None = None  # backup file awaiting confirm
         self._session: aiohttp.ClientSession | None = None
 
     # ── Telegram plumbing ────────────────────────────────────────────
@@ -77,8 +79,18 @@ class WealthBot:
         return data.get("result")
 
     async def send(self, text: str):
-        await self.api("sendMessage", chat_id=self.owner, text=text,
-                       parse_mode="HTML", disable_web_page_preview=True)
+        # Telegram rejects messages >4096 chars — chunk on line boundaries
+        chunks, cur = [], ""
+        for line in text.split("\n"):
+            if len(cur) + len(line) + 1 > 3900:
+                chunks.append(cur)
+                cur = line
+            else:
+                cur = f"{cur}\n{line}" if cur else line
+        chunks.append(cur)
+        for chunk in chunks:
+            await self.api("sendMessage", chat_id=self.owner, text=chunk,
+                           parse_mode="HTML", disable_web_page_preview=True)
 
     async def _download(self, file_id: str, dest: Path) -> Path:
         info = await self.api("getFile", file_id=file_id)
@@ -115,9 +127,10 @@ class WealthBot:
                                 await self._handle_callback(cq)
                             else:
                                 await self._handle(u.get("message") or {})
-                        except Exception:
+                        except Exception as e:
                             log.exception("handler error")
-                            await self.send("⚠️ Error handling that — check logs.")
+                            await self.send(f"⚠️ Error ({type(e).__name__}): "
+                                            f"{html.escape(str(e)[:200])}")
                 except (aiohttp.ClientError, asyncio.TimeoutError):
                     await asyncio.sleep(5)
         finally:
@@ -175,6 +188,8 @@ class WealthBot:
                                 "Is yfinance installed? pip install yfinance pandas")
         elif text.startswith("/screen"):
             await self._screen_cmd()
+        elif text.startswith("/trend"):
+            await self.send(self._trend_card())
         elif text.startswith("/status"):
             await self.send(self._status_card())
         elif text.startswith("/backup"):
@@ -213,6 +228,18 @@ class WealthBot:
 
     async def _on_document(self, doc: dict, caption: str | None):
         name = doc.get("file_name", "file")
+        if name.lower().endswith(".db.gz"):
+            path = await self._download(doc["file_id"], CAS_DIR.parent / "restore" / name)
+            self._pending_restore = str(path)
+            await self.api(
+                "sendMessage", chat_id=self.owner, parse_mode="HTML",
+                text=f"🗄 Restore database from <b>{html.escape(name)}</b>?\n"
+                     "Current data is backed up first, then REPLACED by this file.",
+                reply_markup={"inline_keyboard": [[
+                    {"text": "♻️ Restore", "callback_data": "restore:yes"},
+                    {"text": "Cancel", "callback_data": "restore:no"},
+                ]]})
+            return
         if name.lower().endswith(".csv"):
             path = await self._download(doc["file_id"], CAS_DIR / name)
             try:
@@ -267,13 +294,19 @@ class WealthBot:
                 return
             self._pending_pdf = None
             ret = (s["value"] / s["invested"] - 1) if s["invested"] else 0
+            carried = s.get("isins_carried", 0)
+            isin_note = (
+                f"🔗 {carried}/{s['schemes']} schemes matched to ISINs from your"
+                " CAS — NAV refresh + XIRR keep working for those."
+                if carried else
+                "⚠️ Snapshot only — no ISINs/transactions, so NAV auto-refresh,"
+                " XIRR and /tax stay limited. For full power send the CAMS CAS"
+                " (camsonline.com → detailed statement).")
             await self.send(
                 "✅ <b>Kuvera snapshot imported</b>\n"
                 f"Schemes: {s['schemes']} | Invested: ₹{s['invested']:,.0f}\n"
                 f"<b>Value: ₹{s['value']:,.0f}</b> ({ret:+.1%} absolute)\n\n"
-                "⚠️ Snapshot only — no ISINs/transactions, so NAV auto-refresh,"
-                " XIRR and /tax stay limited. For full power send the CAMS CAS"
-                " (camsonline.com → detailed statement).\n\n/portfolio for details")
+                f"{isin_note}\n\n/portfolio for details")
             return
         self._pending_pdf = None
         await self.send(
@@ -399,6 +432,47 @@ class WealthBot:
         if announce and not ok:
             await self.send("⚠️ Backup created locally but Telegram upload failed.")
 
+    async def _do_restore(self, gz_path: str):
+        import gzip
+        import shutil
+        safety = None
+        try:
+            safety = await asyncio.get_running_loop().run_in_executor(
+                None, backup.make_backup)
+            with gzip.open(gz_path, "rb") as f_in, open(db.DB_PATH, "wb") as f_out:
+                shutil.copyfileobj(f_in, f_out)
+            n = db.networth()  # validates the restored db opens + has schema
+        except Exception as e:
+            await self.send(f"❌ Restore failed ({type(e).__name__}):"
+                            f" {html.escape(str(e)[:200])}\n"
+                            f"Pre-restore safety backup: {safety.name if safety else '—'}")
+            return
+        await self.send(f"♻️ <b>Database restored.</b> Net worth in restored data:"
+                        f" ₹{n['total']:,.0f}\n"
+                        f"(previous db saved as {safety.name})\n/status to verify")
+
+    def _trend_card(self) -> str:
+        rows = db.snapshots_recent(30)
+        if len(rows) < 2:
+            return ("Not enough history yet — snapshots accumulate with each"
+                    " daily digest. Check back in a few days.")
+        rows = list(reversed(rows))  # oldest → newest
+        vals = [r["total"] for r in rows]
+        lo, hi = min(vals), max(vals)
+        blocks = "▁▂▃▄▅▆▇█"
+        spark = "".join(
+            blocks[int((v - lo) / (hi - lo) * 7)] if hi > lo else blocks[0]
+            for v in vals)
+        d = vals[-1] - vals[0]
+        pct = d / vals[0] * 100 if vals[0] else 0
+        return (
+            f"<b>📈 Net Worth — last {len(vals)} snapshots</b>\n\n"
+            f"<code>{spark}</code>\n"
+            f"{rows[0]['date']}: ₹{vals[0]:,.0f}\n"
+            f"{rows[-1]['date']}: ₹{vals[-1]:,.0f}\n"
+            f"{'🟢' if d >= 0 else '🔴'} {'+' if d >= 0 else ''}₹{d:,.0f} ({pct:+.1f}%)"
+        )
+
     def _status_card(self) -> str:
         now = datetime.now(IST)
         up = now - getattr(self, "_started", now)
@@ -507,6 +581,14 @@ class WealthBot:
             return
         data = cq.get("data") or ""
         parts = data.split(":")
+        if parts[0] == "restore":
+            await self.api("answerCallbackQuery", callback_query_id=cq["id"])
+            if parts[1] == "yes" and self._pending_restore:
+                await self._do_restore(self._pending_restore)
+            else:
+                await self.send("Restore cancelled.")
+            self._pending_restore = None
+            return
         if len(parts) == 3 and parts[0] == "rec":
             _, status, rec_id = parts
             rec = db.decide_recommendation(int(rec_id), status)
@@ -645,7 +727,7 @@ class WealthBot:
         if len(rows) > 25:
             lines.append(f"…and {len(rows) - 25} more")
         nav_date = rows[0]["nav_date"] if rows else "?"
-        lines.append(f"\nNAVs as of {nav_date} (CAS import)")
+        lines.append(f"\nNAVs as of {nav_date} (last import/refresh)")
         return "\n".join(lines)
 
     def _stocks_card(self) -> str:

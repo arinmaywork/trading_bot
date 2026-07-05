@@ -15,6 +15,19 @@ from datetime import date, datetime
 
 from . import db
 
+# ── Scheme-name normaliser ───────────────────────────────────────────
+# CAS says "Axis Small Cap Fund - Direct Plan - Growth", Kuvera says
+# "Axis Small Cap Growth Direct Plan". Strip filler words so holdings,
+# transactions and prices from different sources match each other.
+_FILLER = {"fund", "plan", "direct", "regular", "growth", "option", "the",
+           "scheme", "of", "an", "idcw", "payout", "reinvestment"}
+
+
+def norm_scheme(name: str) -> str:
+    tokens = "".join(c.lower() if c.isalnum() else " " for c in name or "").split()
+    return "".join(t for t in tokens if t not in _FILLER)
+
+
 # ── XIRR ─────────────────────────────────────────────────────────────
 
 def xirr(flows: list[tuple[date, float]]) -> float | None:
@@ -71,9 +84,11 @@ def mf_xirr() -> dict:
     """Total + per-scheme XIRR from CAS transactions and current values."""
     today = date.today()
     txns = db.mf_transactions_all()
-    values = {}  # scheme → current value
+    values, values_norm = {}, {}  # scheme → current value (+ normalised key)
     for h in db.mf_holdings():
         values[h["scheme"]] = values.get(h["scheme"], 0) + (h["value"] or 0)
+        k = norm_scheme(h["scheme"])
+        values_norm[k] = values_norm.get(k, 0) + (h["value"] or 0)
 
     by_scheme: dict[str, list] = {}
     for t in txns:
@@ -82,7 +97,8 @@ def mf_xirr() -> dict:
     per_scheme, all_flows = [], []
     for scheme, rows in by_scheme.items():
         flows = _txn_flows(rows)
-        val = values.get(scheme, 0)
+        # exact name first; else normalised (handles Kuvera-vs-CAS naming)
+        val = values.get(scheme) or values_norm.get(norm_scheme(scheme), 0)
         if val > 0:
             flows.append((today, val))
         all_flows.extend(flows)
@@ -204,6 +220,10 @@ def health_card() -> str:
              f"Net worth: <b>₹{n['total']:,.0f}</b>"]
     if x["total"] is not None:
         lines.append(f"MF portfolio XIRR: <b>{x['total']:+.1%}</b>")
+    from . import tax as _tax  # lazy: tax imports analytics
+    eq_x = _tax.equity_xirr()
+    if eq_x is not None:
+        lines.append(f"Equity XIRR (tradebook): <b>{eq_x:+.1%}</b>")
 
     lines.append("\n<b>Allocation vs target</b>")
     b, total = alloc["buckets"], alloc["total"]

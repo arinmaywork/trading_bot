@@ -113,10 +113,12 @@ def realized_gains(fy: str | None = None) -> dict:
 # ── Unrealized lots + harvesting ─────────────────────────────────────
 
 def _current_prices() -> dict[str, float]:
+    """Keyed by exact name AND normalised name (Kuvera/CAS naming differs)."""
     prices = {}
     for h in db.mf_holdings():
         if h["nav"]:
             prices[h["scheme"]] = h["nav"]
+            prices[analytics.norm_scheme(h["scheme"])] = h["nav"]
     for r in db.equity_holdings():
         if r["ltp"]:
             prices[r["symbol"]] = r["ltp"]
@@ -130,7 +132,7 @@ def unrealized_lots() -> list[dict]:
     out = []
     for is_stock, events_by_name in ((False, _mf_events()), (True, _equity_events())):
         for name, events in events_by_name.items():
-            price = prices.get(name)
+            price = prices.get(name) or prices.get(analytics.norm_scheme(name))
             if not price:
                 continue
             open_lots, _ = fifo(events)

@@ -94,7 +94,18 @@ checkpoint, commit WIP, resume later with the task's resume prompt.
 
 ---
 
-## Status: ALL TASKS BUILT (T0–T8). Remaining human steps:
+## T9 — Hardening & versatility pass ✅ (2026-07-05)
+- Fixed: Telegram 4096-char limit (messages now chunk on line boundaries);
+  generic handler surfaces real error type+message; /portfolio footer label.
+- Fixed (data coherence): Kuvera imports now carry ISINs over from prior CAS
+  imports via a scheme-name normaliser (`analytics.norm_scheme`), and XIRR /
+  tax price lookups match across CAS↔Kuvera naming — a Kuvera snapshot no
+  longer silently breaks NAV refresh, XIRR, or /harvest.
+- New: send a `wealth_*.db.gz` backup to the bot → confirm-button restore
+  (safety backup taken first); `/trend` net-worth sparkline from snapshots;
+  equity XIRR (tradebook) shown in /health.
+
+## Status: ALL TASKS BUILT (T0–T9). Remaining human steps:
 1. VM: `git pull && pip install -r wealth_os/requirements.txt && sudo bash deploy/setup-oracle.sh`
 2. Send CAS PDF + tradebook CSV to the bot; /sync; set /goals /surplus /target
 3. Run /backtest → let the gate decide if the swing sleeve ever goes live

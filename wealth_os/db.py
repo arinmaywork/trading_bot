@@ -174,6 +174,13 @@ def snapshot_networth(date_ist: str) -> dict:
     return n
 
 
+def snapshots_recent(n: int = 30) -> list[sqlite3.Row]:
+    with connect() as con:
+        return con.execute(
+            "SELECT * FROM networth_snapshots ORDER BY date DESC LIMIT ?", (n,)
+        ).fetchall()
+
+
 def recent_sips(days: int = 45) -> list[sqlite3.Row]:
     """Schemes with SIP purchases in the last N days → for digest heads-up."""
     with connect() as con:

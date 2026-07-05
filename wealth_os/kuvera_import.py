@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import date
 
-from . import db
+from . import analytics, db
 
 HEADER_MARKERS = ("scheme name", "folio number")
 COLS = 10  # scheme, category, folio, invested, value, units, nav, avg_nav, ret%, xirr%
@@ -51,16 +51,23 @@ def import_kuvera_pdf(path: str) -> dict:
     if not header_seen:
         raise KuveraImportError("not a Kuvera Portfolio Holding Statement")
 
+    # carry ISINs over from any previous CAS import (matched by normalised
+    # name) so AMFI NAV refresh and XIRR keep working after a Kuvera import
+    known_isins = {analytics.norm_scheme(h["scheme"]): h["isin"]
+                   for h in db.mf_holdings() if h["isin"]}
+
     today = date.today().isoformat()
-    holdings, invested_total = [], 0.0
+    holdings, invested_total, isins_carried = [], 0.0, 0
     for r in rows:
         scheme, _cat, folio = r[0].replace("\n", " "), r[1], r[2]
         units, nav, value = _f(r[5]), _f(r[6]), _f(r[4])
         if not scheme or not folio or units is None or not folio[:1].isdigit():
             continue  # header/blank rows
+        isin = known_isins.get(analytics.norm_scheme(scheme))
+        isins_carried += 1 if isin else 0
         holdings.append({
             "folio": folio, "amc": scheme.split()[0], "scheme": scheme,
-            "isin": None, "units": units, "nav": nav,
+            "isin": isin, "units": units, "nav": nav,
             "nav_date": today, "value": value,
         })
         invested_total += _f(r[3]) or 0.0
@@ -73,4 +80,5 @@ def import_kuvera_pdf(path: str) -> dict:
         "schemes": len(holdings),
         "value": sum(h["value"] or 0 for h in holdings),
         "invested": invested_total,
+        "isins_carried": isins_carried,
     }
