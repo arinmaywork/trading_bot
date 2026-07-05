@@ -14,7 +14,13 @@ echo "== 2. Clone / update repo =="
 if [ -d "$DIR/.git" ]; then
   sudo git -C "$DIR" pull
 else
-  sudo git clone "$REPO" "$DIR"
+  # dir may already exist (e.g. cleanup-gcp.sh pre-seeds .env.sh) — clone via
+  # temp dir and merge, preserving any existing .env.sh / data/
+  TMP=$(mktemp -d)
+  git clone "$REPO" "$TMP"
+  sudo mkdir -p "$DIR"
+  sudo cp -a "$TMP"/. "$DIR"/
+  rm -rf "$TMP"
 fi
 sudo chown -R "$USER":"$USER" "$DIR"
 
