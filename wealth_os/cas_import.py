@@ -17,6 +17,19 @@ def import_cas(pdf_path: str, password: str) -> dict:
     except Exception as e:  # bad password, wrong file, etc.
         raise CASImportError(str(e)) from e
 
+    # casparser 0.8.x returns a pydantic model despite output="dict" — normalise
+    if not isinstance(data, dict):
+        if hasattr(data, "model_dump"):      # pydantic v2
+            data = data.model_dump()
+        elif hasattr(data, "dict"):          # pydantic v1
+            data = data.dict()
+        else:
+            raise CASImportError(f"unexpected casparser output: {type(data).__name__}")
+    if "folios" not in data:
+        raise CASImportError(
+            "This looks like an NSDL/CDSL e-CAS (demat statement). Send the "
+            "CAMS/KFintech *mutual fund* CAS instead (camsonline.com → CAS).")
+
     holdings: list[dict] = []
     transactions: list[dict] = []
 
