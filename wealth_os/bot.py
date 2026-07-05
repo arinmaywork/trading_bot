@@ -20,6 +20,7 @@ import pytz
 from . import analytics, backup, db, goals, kite_sync, nav_fetch, swing, tax
 from .cas_import import CASImportError, import_cas
 from .kite_sync import KiteAuthError
+from .kuvera_import import KuveraImportError, import_kuvera_pdf
 
 IST = pytz.timezone("Asia/Kolkata")
 DIGEST_HOUR, DIGEST_MIN = 18, 30    # daily digest at 18:30 IST
@@ -32,8 +33,8 @@ CAS_DIR = Path(__file__).resolve().parent.parent / "data" / "cas"
 
 HELP = (
     "<b>💰 Wealth OS</b>\n\n"
-    "📄 Send your CAMS/KFintech CAS PDF to import mutual funds\n"
-    "     (caption = PDF password, usually your PAN)\n"
+    "📄 Send your CAMS/KFintech CAS PDF (caption = password if protected)\n"
+    "     or a Kuvera Portfolio Holding Statement PDF\n"
     "📄 Send your Zerodha Console tradebook CSV for equity tax data\n\n"
     "/tax — FY capital gains + est. tax + equity XIRR\n"
     "/harvest — LTCG-exemption + tax-loss opportunities\n"
@@ -228,21 +229,41 @@ class WealthBot:
             return
         await self.send(f"📥 Receiving <b>{html.escape(name)}</b>…")
         path = await self._download(doc["file_id"], CAS_DIR / name)
-        if caption:
-            await self._import(str(path), caption.strip())
-        else:
-            self._pending_pdf = str(path)
-            await self.send("🔑 Reply with the PDF password (usually your PAN, uppercase).")
+        await self._import(str(path), (caption or "").strip())
 
     async def _import(self, path: str, password: str):
-        await self.send("⏳ Parsing CAS…")
+        """Try CAS first, then Kuvera; only ask for a password if the PDF
+        is actually encrypted and none was given."""
+        await self.send("⏳ Parsing statement…")
+        loop = asyncio.get_running_loop()
         try:
-            summary = await asyncio.get_running_loop().run_in_executor(
-                None, import_cas, path, password)
-        except CASImportError as e:
-            await self.send(f"❌ Parse failed: {html.escape(str(e)[:200])}\n"
-                            "Wrong password? Send the PDF again.")
+            summary = await loop.run_in_executor(None, import_cas, path, password)
+        except CASImportError as cas_err:
+            # not a CAS (or locked) — try Kuvera holding statement
+            try:
+                s = await loop.run_in_executor(None, import_kuvera_pdf, path)
+            except KuveraImportError:
+                msg = str(cas_err).lower()
+                if "password" in msg or "decrypt" in msg or "encrypted" in msg:
+                    self._pending_pdf = path
+                    await self.send("🔒 This PDF is password-protected. Reply with"
+                                    " the password (usually your PAN, uppercase).")
+                else:
+                    self._pending_pdf = None
+                    await self.send(
+                        f"❌ Couldn't parse: {html.escape(str(cas_err)[:150])}\n\n"
+                        "Supported: CAMS/KFintech CAS (detailed) and Kuvera"
+                        " Portfolio Holding Statement.")
+                return
             self._pending_pdf = None
+            ret = (s["value"] / s["invested"] - 1) if s["invested"] else 0
+            await self.send(
+                "✅ <b>Kuvera snapshot imported</b>\n"
+                f"Schemes: {s['schemes']} | Invested: ₹{s['invested']:,.0f}\n"
+                f"<b>Value: ₹{s['value']:,.0f}</b> ({ret:+.1%} absolute)\n\n"
+                "⚠️ Snapshot only — no ISINs/transactions, so NAV auto-refresh,"
+                " XIRR and /tax stay limited. For full power send the CAMS CAS"
+                " (camsonline.com → detailed statement).\n\n/portfolio for details")
             return
         self._pending_pdf = None
         await self.send(
