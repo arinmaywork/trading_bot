@@ -28,6 +28,10 @@ echo "== 3. Virtualenv (lean wealth_os deps only) =="
 python3 -m venv "$DIR/venv"
 "$DIR/venv/bin/pip" install -q --upgrade pip
 "$DIR/venv/bin/pip" install -q -r "$DIR/wealth_os/requirements.txt"
+# Kuvera PDF support: pdfplumber's pdfminer pin conflicts with casparser's,
+# so install it in a second pass, then restore casparser's exact pdfminer.
+"$DIR/venv/bin/pip" install -q "pdfplumber==0.11.9"
+"$DIR/venv/bin/pip" install -q --no-deps --force-reinstall "pdfminer.six==20240706"
 
 echo "== 4. Secrets =="
 if [ ! -f "$DIR/.env.sh" ]; then
