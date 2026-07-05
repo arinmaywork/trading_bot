@@ -17,7 +17,8 @@ from pathlib import Path
 import aiohttp
 import pytz
 
-from . import analytics, backup, db, goals, kite_sync, nav_fetch, swing, tax
+from . import (advisor, analytics, backup, db, goals, kite_sync, nav_fetch,
+               quality, swing, tax)
 from .cas_import import CASImportError, import_cas
 from .kite_sync import KiteAuthError
 from .kuvera_import import KuveraImportError, import_kuvera_pdf
@@ -35,7 +36,9 @@ HELP = (
     "<b>💰 Wealth OS</b>\n\n"
     "📄 Send your CAMS/KFintech CAS PDF (caption = password if protected)\n"
     "     or a Kuvera Portfolio Holding Statement PDF\n"
-    "📄 Send your Zerodha Console tradebook CSV for equity tax data\n\n"
+    "📄 Send your Zerodha Console tradebook CSV for equity tax data\n"
+    "📄 Send a screener.in quality-screen CSV to veto weak swing picks\n\n"
+    "/ask &lt;question&gt; — AI answers about YOUR portfolio (advisory only)\n"
     "/tax — FY capital gains + est. tax + equity XIRR\n"
     "/harvest — LTCG-exemption + tax-loss opportunities\n"
     "/portfolio — mutual fund holdings\n"
@@ -161,6 +164,14 @@ class WealthBot:
             await self.send(self._networth_card())
         elif text.startswith("/sync"):
             await self._sync_kite()
+        elif text.startswith("/ask"):
+            q = text[4:].strip()
+            if not q:
+                await self.send("Usage: /ask why is my equity allocation high?")
+            else:
+                await self.send("🤔 Thinking…")
+                ctx_answer = await advisor.ask(self._session, q)
+                await self.send(ctx_answer)
         elif text.startswith("/goal "):
             await self._goal_cmd(text)
         elif text.startswith("/goals"):
@@ -242,14 +253,25 @@ class WealthBot:
             return
         if name.lower().endswith(".csv"):
             path = await self._download(doc["file_id"], CAS_DIR / name)
+            loop = asyncio.get_running_loop()
             try:
-                s = await asyncio.get_running_loop().run_in_executor(
+                s = await loop.run_in_executor(
                     None, tax.import_tradebook_csv, str(path))
-            except Exception as e:
-                await self.send(f"❌ Tradebook import failed: {html.escape(str(e)[:200])}")
+                await self.send(f"✅ Tradebook imported: {s['parsed']} trades parsed,"
+                                f" {s['added']} new.\n/tax and /harvest now cover equity.")
                 return
-            await self.send(f"✅ Tradebook imported: {s['parsed']} trades parsed,"
-                            f" {s['added']} new.\n/tax and /harvest now cover equity.")
+            except Exception:
+                pass  # not a tradebook — try screener.in quality export
+            try:
+                s = await loop.run_in_executor(
+                    None, quality.import_screener_csv, str(path))
+                await self.send(
+                    f"✅ Quality screen imported: {s['symbols']} symbols"
+                    f" ({s['names']} names).\n/screen picks outside this list"
+                    " will be marked ⚠️ VETO. Re-upload monthly to keep it fresh.")
+            except Exception as e:
+                await self.send("❌ CSV not recognised as Zerodha tradebook or"
+                                f" screener.in export: {html.escape(str(e)[:150])}")
             return
         if not name.lower().endswith(".pdf"):
             await self.send("Send a CAS PDF or a Zerodha tradebook CSV.")
@@ -382,9 +404,20 @@ class WealthBot:
                             " that is information, not a bug. Stay in the core.")
             return
         lines = [f"<b>📋 Swing Screen — {mode}</b>\n"]
+        vetoed = 0
         for p in picks:
+            ok = quality.is_approved(p["symbol"])
+            veto = "  ⚠️ VETO (not in quality screen)" if ok is False else ""
+            vetoed += 1 if ok is False else 0
             lines.append(f"• <b>{html.escape(p['symbol'])}</b> @ ₹{p['price']:,.1f}"
-                         f" | {p['qty']} sh (₹{p['alloc']:,.0f}) | score {p['score']:.2f}")
+                         f" | {p['qty']} sh (₹{p['alloc']:,.0f})"
+                         f" | score {p['score']:.2f}{veto}")
+        if quality.universe() is None:
+            lines.append("\n<i>Tip: upload a screener.in quality-screen CSV to"
+                         " auto-veto fundamentally weak names.</i>")
+        elif vetoed:
+            lines.append(f"\n⚠️ {vetoed} pick(s) vetoed by your quality screen —"
+                         " skip those, momentum in weak businesses is fragile.")
         lines.append("\nEqual-weight, exit on rank>30 at monthly review."
                      " Approve any trade explicitly — nothing is automatic.")
         await self.send("\n".join(lines))
@@ -705,6 +738,35 @@ class WealthBot:
         if sips:
             lines.append(f"\n📆 {len(sips)} active SIP(s) detected —"
                          " keep balance funded")
+        # 6. CRASH PROTOCOL — the pre-committed message for the bad year.
+        #    Written now, while calm, so future-you reads it while scared.
+        snaps = db.snapshots_recent(365)
+        if snaps:
+            peak = max(r["total"] for r in snaps)
+            dd = (n["total"] - peak) / peak if peak else 0
+            if dd <= -0.10:
+                lines.append(
+                    f"\n🛡 <b>Drawdown protocol active ({dd:.0%} from peak)</b>\n"
+                    "This is the part of the plan we agreed on in advance:\n"
+                    "1. SIPs keep firing — this month's units are the cheapest"
+                    " you've been offered in a while.\n"
+                    "2. Selling now converts a temporary loss into a permanent"
+                    " one. Every -20% in Nifty's history recovered; the only"
+                    " investors hurt were the ones who sold into it.\n"
+                    "3. If you feel the urge to act: /rebalance — if bands"
+                    " trigger, it will tell you to BUY equity cheap, not sell.\n"
+                    "4. Check /trend monthly, not daily, until this passes.")
+        # 7. Annual step-up nudge (first week of April — new FY, appraisals)
+        now = datetime.now(IST)
+        if (now.month == 4 and now.day <= 7
+                and db.get_meta("stepup_nudged") != str(now.year)):
+            db.set_meta("stepup_nudged", str(now.year))
+            cur = goals.monthly_surplus()
+            lines.append(
+                f"\n📈 <b>Annual step-up time.</b> Surplus is ₹{cur:,.0f}/mo —"
+                f" raising it 10% (/surplus {cur * 1.1:,.0f}) adds more to your"
+                " final corpus than almost any return improvement. New FY,"
+                " new increment: pay yourself first.")
         for note in (nav_note, eq_note):
             if note:
                 lines.append(f"\n{note}")

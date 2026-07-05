@@ -105,7 +105,19 @@ checkpoint, commit WIP, resume later with the task's resume prompt.
   (safety backup taken first); `/trend` net-worth sparkline from snapshots;
   equity XIRR (tradebook) shown in /health.
 
-## Status: ALL TASKS BUILT (T0–T9). Remaining human steps:
+## T10 — Wealth pass: AI advisory + quality veto + behavioral guardrails ✅ (2026-07-05)
+- `advisor.py` — `/ask <question>`: Gemini (free tier, REST) answers over a
+  compact JSON snapshot of the user's own data. STRICTLY advisory — system
+  prompt forbids buy/sell calls; signals remain systematic-only.
+  Needs GEMINI_API_KEY in .env.sh (optional GEMINI_MODEL).
+- `quality.py` — screener.in quality-screen CSV upload → veto list; /screen
+  marks momentum picks outside it ⚠️ VETO. Fundamentals used to avoid
+  garbage, not to pick winners (deliberate design).
+- Digest guardrails: CRASH PROTOCOL (drawdown ≥10% from 1y peak → the
+  pre-committed hold-and-buy message) + annual April SIP step-up nudge.
+- CSV router: tradebook → quality screen → clear error.
+
+## Status: ALL TASKS BUILT (T0–T10). Remaining human steps:
 1. VM: `git pull && pip install -r wealth_os/requirements.txt && sudo bash deploy/setup-oracle.sh`
 2. Send CAS PDF + tradebook CSV to the bot; /sync; set /goals /surplus /target
 3. Run /backtest → let the gate decide if the swing sleeve ever goes live
