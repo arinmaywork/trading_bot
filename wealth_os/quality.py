@@ -61,3 +61,59 @@ def is_approved(symbol: str) -> bool | None:
         return symbol.upper() in set(u["symbols"])
     return any(symbol.lower() in n or n.startswith(symbol.lower())
                for n in u["names"])
+
+
+# ── Automatic fundamentals via yfinance (no manual export needed) ────
+# Rules: ROE ≥ 12%, positive profit margin, Debt/Equity < 1.5× (skipped
+# for financials, where leverage is the business model). Missing data →
+# abstain (None), never veto: absence of evidence isn't evidence of junk.
+
+CACHE_KEY = "quality_auto_cache"
+CACHE_DAYS = 30  # fundamentals move quarterly
+
+ROE_MIN, PM_MIN, DE_MAX = 0.12, 0.0, 150.0  # yfinance D/E is in percent
+
+
+def _fetch_info(symbol: str) -> dict:  # patchable in tests
+    import yfinance as yf
+    return yf.Ticker(f"{symbol}.NS").info or {}
+
+
+def _judge(info: dict) -> tuple[bool | None, str]:
+    roe, de = info.get("returnOnEquity"), info.get("debtToEquity")
+    pm, sector = info.get("profitMargins"), info.get("sector") or ""
+    if roe is None and pm is None:
+        return None, "no data"
+    reasons = []
+    if roe is not None and roe < ROE_MIN:
+        reasons.append(f"ROE {roe:.0%}")
+    if pm is not None and pm <= PM_MIN:
+        reasons.append("loss-making")
+    if (de is not None and de > DE_MAX
+            and "financial" not in sector.lower()):
+        reasons.append(f"D/E {de / 100:.1f}x")
+    if reasons:
+        return False, ", ".join(reasons)
+    return True, f"ROE {roe:.0%}" if roe is not None else "ok"
+
+
+def auto_quality(symbols: list[str]) -> dict[str, dict]:
+    """{symbol: {ok: bool|None, why: str}} — cached ~30 days per symbol."""
+    cache = json.loads(db.get_meta(CACHE_KEY) or "{}")
+    cutoff = date.today().toordinal() - CACHE_DAYS
+    out, dirty = {}, False
+    for sym in symbols:
+        hit = cache.get(sym)
+        if hit and hit.get("ord", 0) >= cutoff:
+            out[sym] = {"ok": hit["ok"], "why": hit["why"]}
+            continue
+        try:
+            ok, why = _judge(_fetch_info(sym))
+        except Exception as e:
+            ok, why = None, f"fetch failed ({str(e)[:40]})"
+        out[sym] = {"ok": ok, "why": why}
+        cache[sym] = {"ok": ok, "why": why, "ord": date.today().toordinal()}
+        dirty = True
+    if dirty:
+        db.set_meta(CACHE_KEY, json.dumps(cache))
+    return out

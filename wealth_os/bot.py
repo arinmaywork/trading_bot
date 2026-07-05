@@ -403,21 +403,34 @@ class WealthBot:
             await self.send("No names pass the filters right now (weak tape) —"
                             " that is information, not a bug. Stay in the core.")
             return
+        # quality layer: manual screener list wins if uploaded, else
+        # fundamentals are fetched automatically (yfinance, 30-day cache)
+        manual = quality.universe() is not None
+        auto = {}
+        if not manual:
+            auto = await asyncio.get_running_loop().run_in_executor(
+                None, quality.auto_quality, [p["symbol"] for p in picks])
         lines = [f"<b>📋 Swing Screen — {mode}</b>\n"]
         vetoed = 0
         for p in picks:
-            ok = quality.is_approved(p["symbol"])
-            veto = "  ⚠️ VETO (not in quality screen)" if ok is False else ""
+            if manual:
+                ok = quality.is_approved(p["symbol"])
+                why = "not in quality screen"
+            else:
+                a = auto.get(p["symbol"], {})
+                ok, why = a.get("ok"), a.get("why", "")
+            mark = (f"  ⚠️ VETO ({html.escape(why)})" if ok is False
+                    else f"  ✓ {html.escape(why)}" if ok else "  · no fundamentals data")
             vetoed += 1 if ok is False else 0
             lines.append(f"• <b>{html.escape(p['symbol'])}</b> @ ₹{p['price']:,.1f}"
                          f" | {p['qty']} sh (₹{p['alloc']:,.0f})"
-                         f" | score {p['score']:.2f}{veto}")
-        if quality.universe() is None:
-            lines.append("\n<i>Tip: upload a screener.in quality-screen CSV to"
-                         " auto-veto fundamentally weak names.</i>")
-        elif vetoed:
-            lines.append(f"\n⚠️ {vetoed} pick(s) vetoed by your quality screen —"
+                         f" | score {p['score']:.2f}{mark}")
+        if vetoed:
+            lines.append(f"\n⚠️ {vetoed} pick(s) failed quality checks —"
                          " skip those, momentum in weak businesses is fragile.")
+        src = ("your screener.in list" if manual
+               else "auto fundamentals (ROE≥12%, profitable, D/E<1.5×; banks exempt from D/E)")
+        lines.append(f"<i>Quality source: {src}</i>")
         lines.append("\nEqual-weight, exit on rank>30 at monthly review."
                      " Approve any trade explicitly — nothing is automatic.")
         await self.send("\n".join(lines))
