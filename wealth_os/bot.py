@@ -188,15 +188,13 @@ class WealthBot:
         elif text.startswith("/target"):
             await self._target_cmd(text)
         elif text.startswith("/backtest"):
-            await self.send("🧪 Downloading ~6y EOD for the universe and running"
-                            " the walk-forward — this can take a few minutes…")
-            try:
-                res = await asyncio.get_running_loop().run_in_executor(
-                    None, swing.run_and_gate)
-                await self.send(swing.report_card(res))
-            except Exception as e:
-                await self.send(f"❌ Backtest failed: {html.escape(str(e)[:200])}\n"
-                                "Is yfinance installed? pip install yfinance pandas")
+            if getattr(self, "_backtest_task", None) and not self._backtest_task.done():
+                await self.send("🧪 A backtest is already running — results will"
+                                " arrive here when it finishes.")
+            else:
+                # background task: must NOT block the update loop, or the
+                # heartbeat goes stale and the watchdog kills us mid-run
+                self._backtest_task = asyncio.create_task(self._run_backtest())
         elif text.startswith("/screen"):
             await self._screen_cmd()
         elif text.startswith("/trend"):
@@ -380,6 +378,35 @@ class WealthBot:
         )
 
     # ── Swing sleeve (gated) ─────────────────────────────────────────
+    async def _run_backtest(self):
+        await self.send("🧪 Backtest started: downloading ~6y EOD for the"
+                        " universe, then walk-forward. Takes 5–20 min on this"
+                        " VM — I'll ping progress and post the report here."
+                        " The bot stays responsive meanwhile.")
+        loop = asyncio.get_running_loop()
+        fut = loop.run_in_executor(None, swing.run_and_gate)
+        mins = 0
+        try:
+            while True:
+                try:
+                    res = await asyncio.wait_for(asyncio.shield(fut), timeout=300)
+                    break
+                except asyncio.TimeoutError:
+                    mins += 5
+                    if mins >= 45:
+                        await self.send("❌ Backtest exceeded 45 min — likely a"
+                                        " data-download hang. Try again later or"
+                                        " run on the VM: venv/bin/python -m wealth_os.swing")
+                        return
+                    await self.send(f"🧪 …still running ({mins} min). Normal on"
+                                    " a small VM — Yahoo throttles bulk downloads.")
+            await self.send(swing.report_card(res))
+        except Exception as e:
+            await self.send(f"❌ Backtest failed ({type(e).__name__}):"
+                            f" {html.escape(str(e)[:250])}\n"
+                            "If it's an import error: venv/bin/pip install"
+                            " yfinance pandas && restart.")
+
     async def _screen_cmd(self):
         st = swing.gate_status()
         if not st["gate"]:
