@@ -117,7 +117,16 @@ checkpoint, commit WIP, resume later with the task's resume prompt.
   pre-committed hold-and-buy message) + annual April SIP step-up nudge.
 - CSV router: tradebook → quality screen → clear error.
 
-## Status: ALL TASKS BUILT (T0–T10). Remaining human steps:
+## T11 — Expenses: burn rate, savings rate, surplus truth-check ✅ (2026-07-06)
+- `expense.py` — column-flexible CSV import from any expense app (date/amount
+  autodetect, income rows skipped, idempotent). Deliberately NOT a budgeting
+  app: no category budgets/nagging.
+- `/spend`: 3-mo avg burn, month-to-date, top categories, savings rate
+  (needs `/income`), ⚠️ when configured /surplus drifts >15% from reality,
+  emergency-goal resize suggestion (6 × real burn). Advisor context includes
+  spending. CSV router order: tradebook → expenses → screener.
+
+## Status: ALL TASKS BUILT (T0–T11). Remaining human steps:
 1. VM: `git pull && pip install -r wealth_os/requirements.txt && sudo bash deploy/setup-oracle.sh`
 2. Send CAS PDF + tradebook CSV to the bot; /sync; set /goals /surplus /target
 3. Run /backtest → let the gate decide if the swing sleeve ever goes live

@@ -51,6 +51,13 @@ CREATE TABLE IF NOT EXISTS networth_snapshots (
     cash         REAL,
     total        REAL
 );
+CREATE TABLE IF NOT EXISTS expenses (
+    date     TEXT,
+    amount   REAL,
+    category TEXT,
+    note     TEXT,
+    UNIQUE (date, amount, category, note)
+);
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT

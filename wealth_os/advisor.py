@@ -57,6 +57,15 @@ def build_context() -> str:
         "trend": [{"d": r["date"], "v": round(r["total"])}
                   for r in db.snapshots_recent(10)],
     }
+    from . import expense  # lazy to avoid import cycles
+    burn = expense.monthly_burn()
+    if burn["months"]:
+        income = float(db.get_meta("monthly_income", "0") or 0)
+        ctx["spending"] = {
+            "monthly_burn_3mo_avg": round(burn["avg3"] or 0),
+            "this_month": round(burn["this_month"] or 0),
+            "monthly_income": round(income) or None,
+        }
     return json.dumps(ctx, ensure_ascii=False)
 
 

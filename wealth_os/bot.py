@@ -17,8 +17,8 @@ from pathlib import Path
 import aiohttp
 import pytz
 
-from . import (advisor, analytics, backup, db, goals, kite_sync, nav_fetch,
-               quality, swing, tax)
+from . import (advisor, analytics, backup, db, expense, goals, kite_sync,
+               nav_fetch, quality, swing, tax)
 from .cas_import import CASImportError, import_cas
 from .kite_sync import KiteAuthError
 from .kuvera_import import KuveraImportError, import_kuvera_pdf
@@ -37,7 +37,10 @@ HELP = (
     "📄 Send your CAMS/KFintech CAS PDF (caption = password if protected)\n"
     "     or a Kuvera Portfolio Holding Statement PDF\n"
     "📄 Send your Zerodha Console tradebook CSV for equity tax data\n"
-    "📄 Send a screener.in quality-screen CSV to veto weak swing picks\n\n"
+    "📄 Send a screener.in quality-screen CSV to veto weak swing picks\n"
+    "📄 Send your expense-app CSV export → burn rate, savings rate\n\n"
+    "/spend — monthly burn, savings rate, surplus truth-check\n"
+    "/income 150000 — set monthly income (enables savings rate)\n"
     "/ask &lt;question&gt; — AI answers about YOUR portfolio (advisory only)\n"
     "/tax — FY capital gains + est. tax + equity XIRR\n"
     "/harvest — LTCG-exemption + tax-loss opportunities\n"
@@ -185,6 +188,12 @@ class WealthBot:
         elif text.startswith("/surplus"):
             await self._set_meta_cmd(text, "monthly_surplus",
                                      "Monthly surplus set to ₹{:,.0f}")
+        elif text.startswith("/spend"):
+            await self.send(expense.spend_card())
+        elif text.startswith("/income"):
+            await self._set_meta_cmd(text, "monthly_income",
+                                     "Monthly income set to ₹{:,.0f} — /spend"
+                                     " now shows your savings rate")
         elif text.startswith("/target"):
             await self._target_cmd(text)
         elif text.startswith("/backtest"):
@@ -259,7 +268,18 @@ class WealthBot:
                                 f" {s['added']} new.\n/tax and /harvest now cover equity.")
                 return
             except Exception:
-                pass  # not a tradebook — try screener.in quality export
+                pass  # not a tradebook — try expense export next
+            try:
+                s = await loop.run_in_executor(
+                    None, expense.import_expenses_csv, str(path))
+                await self.send(
+                    f"✅ Expenses imported: {s['added']} new of {s['parsed']}"
+                    f" rows ({s['from']} → {s['to']}"
+                    + (f", {s['skipped_income']} income rows skipped" if s["skipped_income"] else "")
+                    + ").\n/spend for burn rate + savings analysis.")
+                return
+            except Exception:
+                pass  # not expenses — try screener.in quality export
             try:
                 s = await loop.run_in_executor(
                     None, quality.import_screener_csv, str(path))
@@ -268,8 +288,9 @@ class WealthBot:
                     f" ({s['names']} names).\n/screen picks outside this list"
                     " will be marked ⚠️ VETO. Re-upload monthly to keep it fresh.")
             except Exception as e:
-                await self.send("❌ CSV not recognised as Zerodha tradebook or"
-                                f" screener.in export: {html.escape(str(e)[:150])}")
+                await self.send("❌ CSV not recognised as tradebook, expense"
+                                " export, or screener.in screen:"
+                                f" {html.escape(str(e)[:150])}")
             return
         if not name.lower().endswith(".pdf"):
             await self.send("Send a CAS PDF or a Zerodha tradebook CSV.")
